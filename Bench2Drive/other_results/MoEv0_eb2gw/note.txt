@@ -1,0 +1,2 @@
+use VAE (fuse_feat undetach)
+use score head to choose anchor.

@@ -1,0 +1,16 @@
+Running stop test
+
+https://github.com/avg-dev/leaderboard2_human_data/blob/7be6005a137b15eba59eaef637100f1c6abcabe6/scenario_runner/srunner/scenariomanager/scenarioatomics/atomic_criteria.py#L1817
+
+https://github.com/avg-dev/leaderboard2_human_data/blob/7be6005a137b15eba59eaef637100f1c6abcabe6/scenario_runner/srunner/scenariomanager/scenarioatomics/atomic_criteria.py#L1869
+
+https://github.com/avg-dev/leaderboard2_human_data/blob/7be6005a137b15eba59eaef637100f1c6abcabe6/scenario_runner/srunner/scenariomanager/carla_data_provider.py#L609
+https://github.com/avg-dev/leaderboard2_human_data/blob/7be6005a137b15eba59eaef637100f1c6abcabe6/scenario_runner/srunner/scenariomanager/carla_data_provider.py#L758
+
+https://github.com/avg-dev/leaderboard2_human_data/blob/7be6005a137b15eba59eaef637100f1c6abcabe6/scenario_runner/srunner/scenariomanager/weather_sim.py#L152
+https://github.com/avg-dev/leaderboard2_human_data/blob/7be6005a137b15eba59eaef637100f1c6abcabe6/scenario_runner/srunner/scenariomanager/weather_sim.py#L162
+https://github.com/avg-dev/leaderboard2_human_data/blob/7be6005a137b15eba59eaef637100f1c6abcabe6/scenario_runner/srunner/scenariomanager/weather_sim.py#L293
+
+
+Weather is changed to a random weather in sensor agent.
+https://github.com/avg-dev/leaderboard2_human_data/blob/ac6f272a1388357bfbb1d58d1d005d5ddbcfdcfe/team_code/sensor_agent.py#L242

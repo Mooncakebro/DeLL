@@ -1,0 +1,2 @@
+use VAE (fuse_feat undetach)
+use VAE encoder to choose anchor.
