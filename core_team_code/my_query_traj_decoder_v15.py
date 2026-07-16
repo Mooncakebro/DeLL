@@ -250,4 +250,3 @@ class PlanningTrajectoryDecoder(nn.Module):
             )
         device = self.anchors.device
         self.anchors = new_anchors.to(device)
-        print(f"[TrajDecoder] Updated anchors: {new_anchors.shape[0]} anchors")

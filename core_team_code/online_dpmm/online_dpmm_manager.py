@@ -132,7 +132,32 @@ class OnlineDPMMManager:
     # ------------------------------------------------------------------
 
     def _should_update(self, buffer, fit_min_samples: int) -> bool:
-        """Check if a DPMM should be updated based on the schedule."""
+        """Check if a DPMM should be updated based on rank 0's decision.
+
+        In multi-GPU training each rank sees different data batches (via
+        DistributedSampler), so buffers fill at different rates.  If rank 0
+        decides to update but rank 3 hasn't filled its buffer yet, the
+        subsequent ``broadcast()`` will deadlock.
+
+        Fix: rank 0 computes the decision and broadcasts it to all ranks
+        so everyone enters ``_fit_and_swap`` simultaneously.
+        """
+        if self.world_size <= 1:
+            return self._local_should_update(buffer, fit_min_samples)
+
+        # Rank 0 decides, then broadcasts the 1-byte decision
+        if self.rank == 0:
+            decision = self._local_should_update(buffer, fit_min_samples)
+            decision_tensor = torch.tensor([1 if decision else 0],
+                                           dtype=torch.int, device=self.device)
+        else:
+            decision_tensor = torch.tensor([0], dtype=torch.int, device=self.device)
+
+        torch.distributed.broadcast(decision_tensor, src=0)
+        return bool(decision_tensor.item())
+
+    def _local_should_update(self, buffer, fit_min_samples: int) -> bool:
+        """Check update condition on rank 0 only (no collective calls)."""
         if self.global_step < self.config.dpmm_update_start_step:
             return False
         # Periodic update mode
@@ -209,31 +234,32 @@ class OnlineDPMMManager:
             anchor_dim_slice: If not None, slice mu to first N dims (traj=20).
             update_fn: Model method to call with new anchors.
         """
-        buffer_data = buffer.get_all()  # (N, dim) on CPU
-
-        # Mix with replay samples from existing DPMM
-        fit_data = self._mix_replay(dpmm, buffer_data, replay_ratio, max_replay)
-        fit_data = purge_invalid_values(fit_data, f"{tag}_dpmm_fit")
-
-        if fit_data.shape[0] == 0:
-            print(f"[OnlineDPMM] Skipping {tag} update: no valid data")
-            return
-
-        # Fit on rank 0 only (bnpy is CPU-only, not distributed)
+        # Only rank 0 needs to prepare data and fit; other ranks just
+        # need to participate in the collective broadcast below.
         new_anchors = None
         if self.rank == 0:
-            print(f"[OnlineDPMM] Fitting {tag} DPMM with {fit_data.shape[0]} samples "
-                  f"(buffer={buffer_data.shape[0]}, step={self.global_step})")
-            dpmm.fit(fit_data)
-            new_anchors = self._extract_anchors(dpmm, anchor_dim_slice)
-            self._log_dpmm_state(dpmm, tag)
-            print(f"[OnlineDPMM] {tag} DPMM updated: {new_anchors.shape[0]} clusters")
+            buffer_data = buffer.get_all()  # (N, dim) on CPU
+            fit_data = self._mix_replay(dpmm, buffer_data, replay_ratio, max_replay)
+            fit_data = purge_invalid_values(fit_data, f"{tag}_dpmm_fit")
 
-        # Broadcast anchors from rank 0 to all ranks
+            if fit_data.shape[0] == 0:
+                print(f"[OnlineDPMM] Skipping {tag} update: no valid data")
+            else:
+                print(f"[OnlineDPMM] Fitting {tag} DPMM with {fit_data.shape[0]} samples "
+                      f"(buffer={buffer_data.shape[0]}, step={self.global_step})")
+                dpmm.fit(fit_data)
+                new_anchors = self._extract_anchors(dpmm, anchor_dim_slice)
+                self._log_dpmm_state(dpmm, tag)
+                print(f"[OnlineDPMM] {tag} DPMM updated: {new_anchors.shape[0]} clusters")
+
+        # Broadcast anchors from rank 0 to all ranks (collective — all
+        # ranks must call this).  If rank 0 had no data, it broadcasts
+        # shape (0, 0) and everyone gets an empty tensor.
         new_anchors = self._broadcast_anchors(new_anchors)
 
-        # Hot-swap anchors into model
-        update_fn(new_anchors.to(self.device))
+        # Hot-swap anchors into model (only if we got real anchors)
+        if new_anchors.numel() > 0:
+            update_fn(new_anchors.to(self.device))
 
         # Reset buffer so it doesn't immediately re-trigger
         buffer.reset()
@@ -282,21 +308,22 @@ class OnlineDPMMManager:
         """Broadcast anchors from rank 0 to all ranks.
 
         Handles variable K (number of clusters) by broadcasting shape first.
+        Tensors are moved to ``self.device`` because the NCCL backend
+        (used for GPU distributed training) does not support CPU tensors.
         """
         if self.world_size <= 1:
             if anchors is None:
-                raise RuntimeError("Rank 0 produced no anchors")
+                return torch.empty(0, 0, dtype=torch.float32)
             return anchors
 
-        # Broadcast shape (2,) from rank 0
+        # Broadcast shape (2,) from rank 0 — must be on GPU for NCCL
         if self.rank == 0:
             if anchors is None:
-                # Signal no anchors with shape (0, 0)
-                shape = torch.tensor([0, 0], dtype=torch.long)
+                shape = torch.tensor([0, 0], dtype=torch.long, device=self.device)
             else:
-                shape = torch.tensor(anchors.shape, dtype=torch.long)
+                shape = torch.tensor(anchors.shape, dtype=torch.long, device=self.device)
         else:
-            shape = torch.empty(2, dtype=torch.long)
+            shape = torch.empty(2, dtype=torch.long, device=self.device)
 
         torch.distributed.broadcast(shape, src=0)
 
@@ -304,12 +331,15 @@ class OnlineDPMMManager:
         if shape[0] == 0 or shape[1] == 0:
             return torch.empty(0, 0, dtype=torch.float32)
 
-        # Broadcast data
-        if self.rank != 0:
-            anchors = torch.empty(*shape, dtype=torch.float32)
+        # Broadcast data — must be on GPU for NCCL
+        if self.rank == 0:
+            anchors = anchors.to(self.device)
+        else:
+            anchors = torch.empty(*shape, dtype=torch.float32, device=self.device)
         torch.distributed.broadcast(anchors, src=0)
 
-        return anchors
+        # Return on CPU; caller moves to device as needed
+        return anchors.cpu()
 
     # ------------------------------------------------------------------
     # Logging

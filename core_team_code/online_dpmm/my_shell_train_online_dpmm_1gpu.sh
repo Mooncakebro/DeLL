@@ -12,6 +12,7 @@ set -euo pipefail
 export PROJECT_ROOT=/home/spc/Dell
 export CARLA_ROOT=/home/spc/carla_0_9_15
 
+export PYTHONPATH=/share/home/u19666033/syb/Dell/bnpy:$PYTHONPATH
 export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI
 export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla
 export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg

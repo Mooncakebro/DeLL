@@ -217,6 +217,5 @@ class FuseFeatFrontDoorEncoder(nn.Module):
             )
         device = self.anchors.device
         self.anchors = new_anchors.to(device)
-        print(f"[FuseFeatFrontDoor] Updated anchors: {new_anchors.shape[0]} anchors")
 
 

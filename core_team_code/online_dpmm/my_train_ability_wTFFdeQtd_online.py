@@ -254,7 +254,22 @@ def main():
     world_size = int(os.environ['WORLD_SIZE'])
     print(f'RANK/LOCAL_RANK/WORLD_SIZE: {rank}/{local_rank}/{world_size}')
 
+    # Set the CUDA device BEFORE init_process_group — NCCL requires
+    # each process to have already bound to its GPU.
+    # torch.cuda.set_device() is permanent; torch.cuda.device() is only
+    # a context manager and does nothing when called bare.
+    torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
+
+    ngpus_per_node = torch.cuda.device_count()
+    if ngpus_per_node == 0:
+        raise RuntimeError(
+            f'[Rank {rank}] torch.cuda.device_count() == 0. '
+            f'CUDA_VISIBLE_DEVICES="{os.environ.get("CUDA_VISIBLE_DEVICES", "")}"')
+    if local_rank >= ngpus_per_node:
+        raise RuntimeError(
+            f'[Rank {rank}] local_rank={local_rank} >= ngpus_per_node={ngpus_per_node}. '
+            f'CUDA_VISIBLE_DEVICES="{os.environ.get("CUDA_VISIBLE_DEVICES", "")}"')
 
     torch.distributed.init_process_group(backend='nccl',
                                           init_method='env://',
@@ -262,10 +277,8 @@ def main():
                                           rank=rank,
                                           timeout=datetime.timedelta(minutes=15))
 
-    ngpus_per_node = torch.cuda.device_count()
     ncpus_per_node = args.cpu_cores
     num_workers = int(ncpus_per_node / ngpus_per_node)
-    torch.cuda.device(device)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
@@ -376,7 +389,7 @@ def main():
     if config.use_plant:
         find_unused_parameters = True
     model = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=None, output_device=None,
+        model, device_ids=[local_rank], output_device=local_rank,
         broadcast_buffers=False, find_unused_parameters=find_unused_parameters)
 
     if config.use_optim_groups:
@@ -479,6 +492,11 @@ def main():
         if ability_idx > 0:
             prev_ability = ability_list[ability_idx - 1]
             prev_latest = os.path.join(args.logdir, prev_ability, 'latest.pth')
+
+            # Rank 0 saved latest.pth at the end of the previous ability;
+            # all ranks must wait until the file is on disk before loading.
+            torch.distributed.barrier()
+
             if os.path.isfile(prev_latest):
                 if rank == 0:
                     print(f'Loading checkpoint from previous ability: {prev_latest}')
@@ -489,8 +507,12 @@ def main():
 
         # --- Re-create dataset for this ability ---
         config.selected_ability = ability_name
+        # --root_dir from CLI overrides config.dataset_root so the shell
+        # script's DATASET_ROOT variable controls which dataset is used.
+        if config.root_dir:
+            config.dataset_root = config.root_dir[0] if isinstance(config.root_dir, list) else config.root_dir
         train_set = Ability_CARLA_Data(
-            root=config.mini_dataset_root,
+            root=config.dataset_root,
             config=config,
             estimate_class_distributions=config.estimate_class_distributions,
             estimate_sem_distribution=config.estimate_semantic_distribution,
@@ -553,6 +575,10 @@ def main():
                 optimizer.consolidate_state_dict(0)
             if rank == 0:
                 trainer.save()
+
+            # Ensure rank 0 finishes saving before other ranks proceed
+            # (especially important when the next ability loads latest.pth).
+            torch.distributed.barrier()
 
             trainer.cur_epoch += 1
             trainer.global_epoch += 1

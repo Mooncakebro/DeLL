@@ -19,16 +19,22 @@
 # =====================================================================
 
 export CARLA_ROOT=/share/home/u19666033/djy/carla2
+export PROJECT_ROOT=/share/home/u19666033/syb/Dell
+# Explicitly prepend bnpy repo dir so Python finds bnpy/bnpy/__init__.py
+# instead of treating the bnpy/ repo root as a namespace package.
+export PYTHONPATH=/share/home/u19666033/syb/Dell/bnpy:$PYTHONPATH
+export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI
+export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla
+export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla/dist/carla-0.9.15-py3.7-linux-x86_64.egg
 export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla/":${PYTHONPATH}
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/share/apps/anaconda3/lib
 source /share/apps/anaconda3/etc/profile.d/conda.sh
-conda activate syb_garage_2
+conda activate dell
 
 export OMP_NUM_THREADS=8
 export OPENBLAS_NUM_THREADS=1
 
 # --- Paths ---
-export PROJECT_ROOT=/share/home/u19666033/syb/carla_garage
 LOGDIR=${PROJECT_ROOT}/log
 DATASET_ROOT=/share/home/u19666033/syb/pdm_dataset
 EXP_ID=syb_online_dpmm_1gpu

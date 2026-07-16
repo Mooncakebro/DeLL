@@ -35,10 +35,8 @@ class BNPModel:
         self.save_dir = save_dir
         self.num_lap = num_lap
         self.sF = sF
-        if not os.path.exists(os.path.join(self.save_dir, 'birth_debug')):
-            os.makedirs(os.path.join(self.save_dir, 'birth_debug'))
-        if not os.path.exists(os.path.join(self.save_dir, 'data')):
-            os.makedirs(os.path.join(self.save_dir, 'data'))
+        os.makedirs(os.path.join(self.save_dir, 'birth_debug'), exist_ok=True)
+        os.makedirs(os.path.join(self.save_dir, 'data'), exist_ok=True)
 
         self.birth_kwargs = birth_kwargs
         self.merge_kwargs = merge_kwargs

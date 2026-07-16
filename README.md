@@ -100,7 +100,7 @@ We provide two types of data for training and evaluation.
 
 ### Full Dataset
 
-We use dataset collected by PDM_lite to train the model.
+We use dataset collected by PDM_Lite to train the model.
 The dataset is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0).
 You can download it via [Hugging Face](https://huggingface.co/datasets/autonomousvision/PDM_Lite_Carla_LB2/tree/main).
 

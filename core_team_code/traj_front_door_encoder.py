@@ -244,4 +244,3 @@ class TrajFrontDoorEncoder(nn.Module):
             )
         device = self.anchors.device
         self.anchors = new_anchors.to(device)
-        print(f"[TrajFrontDoor] Updated anchors: {new_anchors.shape[0]} anchors")
