@@ -109,7 +109,7 @@ You can download it via [Hugging Face](https://huggingface.co/datasets/autonomou
 For quick experimentation, we provide a mini dataset (`Dell_material/b2d_mini`) containing a small subset of the full data.
 The mini dataset is available on Google Drive:
 
-> **Google Drive link:** *(to be added)*
+> **Google Drive link:** (https://drive.google.com/file/d/1e7C3CaCsbHFuBfQqW-Y4hJOS5TPbsz8O/view?usp=sharing)
 
 After downloading, place the `Dell_material/` folder at the project root. The `--root_dir` training argument should point to `Dell_material/b2d_mini` when using the mini dataset.
 
@@ -198,6 +198,11 @@ Evaluate the model after **each** ability (not just the last one) to build the 5
 ## Lifelong Learning Metrics
 
 After completing all 5 abilities and evaluating the model at each stage, use `lifelong_metric/forgetting_and_transfer_eval.py` to compute lifelong learning metrics.
+
+### Obtain DS, SR, SR per Ability
+Use the scripts:
+1. `Bench2Drive/tools/my_merge_route_json.py` for merging the results saved from evaluation.
+2. `Bench2Drive/tools/ability_benchmark.py` to get the SR per ability.
 
 ### Building the Skill Matrix
 
