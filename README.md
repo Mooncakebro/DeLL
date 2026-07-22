@@ -14,7 +14,7 @@
 
 ## Overview
 
-**DELL** is a continual learning framework for end-to-end autonomous driving, built on top of the [CARLA Garage](https://github.com/autonomousvision/carla_garage) (TransFuser++) codebase. It addresses catastrophic forgetting in multi-ability driving scenarios by co-training the neural network with two **Dirichlet Process Mixture Model (DPMM)** knowledge spaces — one for trajectory anchors and one for fused-feature anchors — that are updated *online* during training.
+**DeLL** is a continual learning framework for end-to-end autonomous driving, built on top of the [CARLA Garage](https://github.com/autonomousvision/carla_garage) (TransFuser++) codebase. It addresses catastrophic forgetting in multi-ability driving scenarios by co-training the neural network with two **Dirichlet Process Mixture Model (DPMM)** knowledge spaces — one for trajectory anchors and one for fused-feature anchors — that are updated *online* during training.
 
 ### Key Ideas
 
