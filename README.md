@@ -1,4 +1,6 @@
-# DELL: Lifelong Autonomous Driving with Knowledge Spaces
+<h1 align="center">
+  [ECCV2026] <span style="color:#2d7ee7;">DeLL</span>: Deconfounded Lifelong Learning for Autonomous Driving via Dynamic Knowledge Spaces
+</h1>
 
 <p align="center">
   <img src="arch.jpeg" alt="DELL Framework" width="900"/>
