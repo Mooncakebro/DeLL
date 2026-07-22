@@ -121,6 +121,7 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
     def setup(self, path_to_conf_file, route_index=None, traffic_manager=None):
         print('[OnlineDPMMAgent] setup start.')
         torch.cuda.empty_cache()
+        self.save_path = None  # ensure this exists even if setup fails early
         self.IS_BENCH2DRIVE = strtobool(os.environ.get('IS_BENCH2DRIVE', 'False'))
         self.track = (autonomous_agent.Track.MAP
                       if os.environ.get('CHALLENGE_TRACK_CODENAME') == 'MAP'
@@ -131,7 +132,8 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
         self.device = torch.device('cuda:0')
 
         # Load saved config
-        with open(os.path.join(self.config_path, 'config.json'), 'rt', encoding='utf-8') as f:
+        parent_config_path = os.path.dirname(self.config_path)
+        with open(os.path.join(parent_config_path, 'config.json'), 'rt', encoding='utf-8') as f:
             saved_config = jsonpickle.decode(f.read())
         self.config = GlobalConfig()
         self.config.__dict__.update(saved_config.__dict__)
@@ -161,6 +163,28 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
                 if self.config.sync_batch_norm:
                     net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
                 state_dict = torch.load(path, map_location=self.device)
+
+                # Fix anchor-size mismatches: the checkpoint stores DPMM-computed
+                # anchors (e.g. 99) but __init__ may have created a placeholder (1)
+                # because config.prior_traj_path / prior_fuseFeat_path were empty.
+                for anchor_key in ['query_traj_decoder.anchors',
+                                   'traj_frontdoor_encoder.anchors',
+                                   'fuseFeat_frontdoor_encoder.anchors']:
+                    if anchor_key not in state_dict:
+                        continue
+                    ckpt_shape = state_dict[anchor_key].shape
+                    # walk into nested modules: e.g. query_traj_decoder.anchors
+                    parts = anchor_key.split('.')
+                    obj = net
+                    for p in parts[:-1]:
+                        obj = getattr(obj, p)
+                    if hasattr(obj, 'anchors') and obj.anchors.shape != ckpt_shape:
+                        print(f'[OnlineDPMMAgent] Resizing {anchor_key} '
+                              f'{list(obj.anchors.shape)} -> {list(ckpt_shape)}')
+                        obj.register_buffer('anchors',
+                            torch.zeros(ckpt_shape, dtype=obj.anchors.dtype,
+                                        device=obj.anchors.device))
+
                 net.load_state_dict(state_dict, strict=False)
                 net.cuda(device=self.device)
                 net.eval()
@@ -433,7 +457,7 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
             pred_speed_scalar = self.inference_target_speeds[torch.argmax(pred_spd_ens).item()]
 
         pred_ckpts = torch.stack(pred_checkpoints, dim=0).mean(dim=0).detach().cpu().numpy()
-        steer, throttle, brake = self.nets[0].control_pid_direct(pred_ckpts, pred_speed_scalar, speed)
+        steer, throttle, brake = self.nets[0].control_pid_direct(pred_ckpts, pred_speed_scalar, velocity)
 
         # Stuck detector
         if speed < 0.1:
@@ -479,11 +503,14 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
             box[4] = t_u.normalize_angle(box[4] - rot_diff)
 
     def destroy(self, results=None):
-        if self.save_path is not None:
+        if hasattr(self, 'save_path') and self.save_path is not None:
             self.lon_logger.dump_to_json()
-            if len(self.nets[0].speed_histogram) > 0:
+            if self.nets and len(self.nets[0].speed_histogram) > 0:
                 with gzip.open(self.save_path / 'target_speeds.json.gz', 'wt', encoding='utf-8') as f:
                     ujson.dump(self.nets[0].speed_histogram, f, indent=4)
-        del self.nets
-        del self.config
-        del self.metric_info
+        if hasattr(self, 'nets'):
+            del self.nets
+        if hasattr(self, 'config'):
+            del self.config
+        if hasattr(self, 'metric_info'):
+            del self.metric_info
