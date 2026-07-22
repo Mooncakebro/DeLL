@@ -1,5 +1,7 @@
 <h1 align="center">
-  [ECCV2026] <span style="color:#2d7ee7;">DeLL</span>: Deconfounded Lifelong Learning for Autonomous Driving via Dynamic Knowledge Spaces
+  [ECCV2026] <span style="color:#2d7ee7;">DeLL</span>: <span style="color:#2d7ee7;">De</span>confounded 
+  <span style="color:#2d7ee7;">L</span>ifelong 
+  <span style="color:#2d7ee7;">L</span>earning for Autonomous Driving via Dynamic Knowledge Spaces
 </h1>
 
 <p align="center">
