@@ -125,7 +125,7 @@ Training is done in two stages: (1) perception pre-training (Stage 1, you can di
 
 ### Stage 1: Perception Pre-training
 
-Follow the [original training instructions](README.md#training) in the CARLA Garage README. Use `team_code/train.py` with `--use_controller_input_prediction 0` to pre-train the backbone. The resulting checkpoint (e.g., `model_0030.pth`) will be used as the `--load_file` for Stage 2.
+Follow the original training instructions in the [CARLA Garage README](https://github.com/autonomousvision/carla_garage). Use `team_code/train.py` with `--use_controller_input_prediction 0` to pre-train the backbone. The resulting checkpoint (e.g., `model_0030.pth`) will be used as the `--load_file` for Stage 2.
 
 ### Stage 2: Online DPMM Training
 
