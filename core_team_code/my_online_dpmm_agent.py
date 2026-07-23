@@ -457,7 +457,7 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
             pred_speed_scalar = self.inference_target_speeds[torch.argmax(pred_spd_ens).item()]
 
         pred_ckpts = torch.stack(pred_checkpoints, dim=0).mean(dim=0).detach().cpu().numpy()
-        steer, throttle, brake = self.nets[0].control_pid_direct(pred_ckpts, pred_speed_scalar, velocity)
+        steer, throttle, brake = self.nets[0].control_pid_direct(pred_ckpts, pred_speed_scalar, tick_data['speed'])
 
         # Stuck detector
         if speed < 0.1:

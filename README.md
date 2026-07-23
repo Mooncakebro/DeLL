@@ -153,8 +153,8 @@ bash core_team_code/online_dpmm/my_shell_train_online_dpmm_1gpu.sh
 | `--online_dpmm` | `1` | Enable online alternating DPMM mode |
 | `--use_traj_front_door_encoder` | `1` | Enable trajectory front-door encoder |
 | `--use_prior_fuseFeat` | `1` | Enable fused-feature front-door encoder |
-| `--traj_dpmm_buffer_size` | `5000` | Trajectory DPMM ring buffer size |
-| `--fusefeat_dpmm_buffer_size` | `5000` | Fused-feature DPMM ring buffer size |
+| `--traj_dpmm_buffer_size` | `500` | Trajectory DPMM ring buffer size |
+| `--fusefeat_dpmm_buffer_size` | `500` | Fused-feature DPMM ring buffer size |
 | `--dpmm_update_start_step` | `200` | Minimum steps before first DPMM fit |
 | `--epochs` | `31` | Epochs *per ability* (total = 31 × 5 = 155) |
 | `--freeze_backbone` | `1` | Freeze backbone (use Stage 1 weights) |
