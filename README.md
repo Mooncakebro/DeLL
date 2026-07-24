@@ -251,12 +251,6 @@ python lifelong_metric/forgetting_and_transfer_eval.py
 
 ---
 
-## Pre-trained Weights
-
-Pre-trained model weights will be released soon.
-
----
-
 ## Project Structure
 
 ```
