@@ -167,10 +167,13 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
                 # Fix anchor-size mismatches: the checkpoint stores DPMM-computed
                 # anchors (e.g. 99) but __init__ may have created a placeholder (1)
                 # because config.prior_traj_path / prior_fuseFeat_path were empty.
-                for anchor_key in ['query_traj_decoder.anchors',
-                                   'traj_frontdoor_encoder.anchors',
-                                   'fuseFeat_frontdoor_encoder.anchors']:
+                anchor_keys = ['query_traj_decoder.anchors',
+                               'traj_frontdoor_encoder.anchors',
+                               'fuseFeat_frontdoor_encoder.anchors']
+                for anchor_key in anchor_keys:
                     if anchor_key not in state_dict:
+                        print(f'[OnlineDPMMAgent] WARNING: {anchor_key} not found in checkpoint; '
+                              f'keeping placeholder.')
                         continue
                     ckpt_shape = state_dict[anchor_key].shape
                     # walk into nested modules: e.g. query_traj_decoder.anchors
@@ -185,7 +188,22 @@ class OnlineDPMMSensorAgent(autonomous_agent.AutonomousAgent):
                             torch.zeros(ckpt_shape, dtype=obj.anchors.dtype,
                                         device=obj.anchors.device))
 
-                net.load_state_dict(state_dict, strict=False)
+                load_result = net.load_state_dict(state_dict, strict=False)
+
+                # Verify each anchor was actually loaded from the checkpoint
+                for anchor_key in anchor_keys:
+                    if anchor_key not in state_dict:
+                        continue
+                    if anchor_key in load_result.missing_keys:
+                        print(f'[OnlineDPMMAgent] WARNING: {anchor_key} in checkpoint but '
+                              f'NOT loaded into model (shape mismatch?). Placeholder remains.')
+                    else:
+                        parts = anchor_key.split('.')
+                        obj = net
+                        for p in parts[:-1]:
+                            obj = getattr(obj, p)
+                        print(f'[OnlineDPMMAgent] OK: {anchor_key} loaded from checkpoint, '
+                              f'shape {list(obj.anchors.shape)}.')
                 net.cuda(device=self.device)
                 net.eval()
                 if self.compile:
