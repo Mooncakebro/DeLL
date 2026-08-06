@@ -80,7 +80,7 @@ class FuseFeatFrontDoorEncoder(nn.Module):
         """
         if anchor_path_list is None:
             print('No fuseFeat anchor path provided. Using random placeholder '
-                  '(will be replaced by online DPMM).')
+                  '(replaced before task training).')
             anchors = torch.randn(1, 256 * 11) * 0.01
             self.register_buffer('anchors', anchors)
             print(f'[FuseFeatFrontDoor] Created 1 random placeholder anchor, shape: {anchors.shape}')
@@ -113,7 +113,7 @@ class FuseFeatFrontDoorEncoder(nn.Module):
         
         if not all_clusters:
             print('No valid anchor data found. Using random placeholder anchors '
-                  '(will be replaced by online DPMM).')
+                  '(replaced before task training).')
             anchors = torch.randn(1, 256 * 11) * 0.01
             self.register_buffer('anchors', anchors)
             print(f'[FuseFeatFrontDoor] Created 1 random placeholder anchor, shape: {anchors.shape}')
@@ -216,6 +216,6 @@ class FuseFeatFrontDoorEncoder(nn.Module):
                 f"existing={self.anchors.shape[1]}"
             )
         device = self.anchors.device
-        self.anchors = new_anchors.to(device)
-
-
+        with torch.inference_mode(False):
+            self.anchors = new_anchors.detach().clone().to(
+                device=device, dtype=self.anchors.dtype)

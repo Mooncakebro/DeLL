@@ -1,36 +1,26 @@
 """
-Online DPMM manager for alternating network–DPMM training.
+Online DPMM manager for task-boundary DPMM preparation.
 
 This module provides ``OnlineDPMMManager``, which encapsulates:
     - Two ``TensorRingBuffer`` instances (one per DPMM knowledge space).
     - Two ``BNPModel`` instances (traj DPMM and fuseFeat DPMM).
-    - The alternating update schedule: when a buffer fills, the corresponding
-      DPMM is fitted (on rank 0), new anchors are broadcast to all ranks, and
-      the model's decoders/encoders are hot-swapped.
+    - A bounded-memory streaming update schedule used before each task.
+    - Final anchor broadcast and hot-swap after every task dataset has been
+      fully consumed, before network optimization begins.
 
 Usage (inside a training loop)::
 
     manager = OnlineDPMMManager(config, logdir, device, rank, world_size)
-    manager.init_buffers()
-
+    manager.begin_task('Emergency_Brake')
     for batch in dataloader:
-        # ... forward, loss, backward, optimizer step ...
-
-        # Fill buffers with data from this batch
-        manager.fill_traj_buffer(batch['route'][:, :10])
-        manager.fill_fusefeat_buffer(model.last_joined_features)
-
-        # Check if either DPMM should update
-        manager.maybe_update_traj_dpmm(model)
-        manager.maybe_update_fusefeat_dpmm(model)
-
+        manager.consume_task_batch(batch['route'][:, :10], joined_features)
+    manager.finalize_task(model)
     manager.save()
 """
 
 import os
 import json
 import torch
-import numpy as np
 
 from dpmm_ring_buffer import TensorRingBuffer
 
@@ -45,7 +35,7 @@ from utils import convert_tensor_to_list, purge_invalid_values
 
 
 class OnlineDPMMManager:
-    """Manages two DPMMs and their ring buffers for online alternating training.
+    """Manages two DPMMs and bounded buffers at task boundaries.
 
     Args:
         config: GlobalConfig instance with online DPMM parameters.
@@ -64,6 +54,11 @@ class OnlineDPMMManager:
         self.world_size = world_size
         self.global_step = 0
         self.update_count = 0
+        self.current_task = None
+        self.tag_update_counts = {'traj': 0, 'fusefeat': 0}
+        self.anchors_ready_for_task = False
+        self.enable_traj = bool(config.use_controller_input_prediction)
+        self.enable_fusefeat = bool(config.use_prior_fuseFeat)
 
         # --- Trajectory DPMM ---
         self.traj_buffer = TensorRingBuffer(
@@ -97,172 +92,157 @@ class OnlineDPMMManager:
             os.makedirs(os.path.join(logdir, config.dpmm_log_dir, 'traj'), exist_ok=True)
             os.makedirs(os.path.join(logdir, config.dpmm_log_dir, 'fusefeat'), exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Buffer filling
-    # ------------------------------------------------------------------
-
-    def fill_traj_buffer(self, traj_batch: torch.Tensor) -> None:
-        """Add ground-truth trajectory data to the traj buffer.
-
-        Args:
-            traj_batch: (B, predict_checkpoint_len, 2) or (B, 20) tensor.
-        """
-        if traj_batch is None:
-            return
-        traj_flat = traj_batch.detach().reshape(traj_batch.shape[0], -1)
-        self.traj_buffer.add_batch(traj_flat)
-
-    def fill_fusefeat_buffer(self, fusefeat_batch: torch.Tensor) -> None:
-        """Add fused-feature data to the fuseFeat buffer.
-
-        Args:
-            fusefeat_batch: (B, 11, 256) or (B, 2816) tensor.
-        """
-        if fusefeat_batch is None:
-            return
-        fusefeat_flat = fusefeat_batch.detach().reshape(fusefeat_batch.shape[0], -1)
-        self.fusefeat_buffer.add_batch(fusefeat_flat)
-
     def step(self) -> None:
         """Increment the global step counter."""
         self.global_step += 1
 
     # ------------------------------------------------------------------
-    # Update scheduling
+    # Task-boundary streaming preparation
     # ------------------------------------------------------------------
 
-    def _should_update(self, buffer, fit_min_samples: int) -> bool:
-        """Check if a DPMM should be updated based on rank 0's decision.
-
-        In multi-GPU training each rank sees different data batches (via
-        DistributedSampler), so buffers fill at different rates.  If rank 0
-        decides to update but rank 3 hasn't filled its buffer yet, the
-        subsequent ``broadcast()`` will deadlock.
-
-        Fix: rank 0 computes the decision and broadcasts it to all ranks
-        so everyone enters ``_fit_and_swap`` simultaneously.
-        """
-        if self.world_size <= 1:
-            return self._local_should_update(buffer, fit_min_samples)
-
-        # Rank 0 decides, then broadcasts the 1-byte decision
+    def begin_task(self, task_name: str) -> None:
+        """Start a fresh streaming pass for one task without resetting DPMMs."""
+        self.current_task = str(task_name)
+        self.anchors_ready_for_task = False
+        self.traj_buffer.reset()
+        self.fusefeat_buffer.reset()
         if self.rank == 0:
-            decision = self._local_should_update(buffer, fit_min_samples)
-            decision_tensor = torch.tensor([1 if decision else 0],
-                                           dtype=torch.int, device=self.device)
-        else:
-            decision_tensor = torch.tensor([0], dtype=torch.int, device=self.device)
+            print(f"[OnlineDPMM] Preparing anchors for task: {self.current_task}")
 
-        torch.distributed.broadcast(decision_tensor, src=0)
-        return bool(decision_tensor.item())
+    def consume_task_batch(self, traj_batch=None, fusefeat_batch=None) -> None:
+        """Stream one gathered task batch through bounded buffers on rank 0.
 
-    def _local_should_update(self, buffer, fit_min_samples: int) -> bool:
-        """Check update condition on rank 0 only (no collective calls)."""
-        if self.global_step < self.config.dpmm_update_start_step:
-            return False
-        # Periodic update mode
-        if self.config.dpmm_update_freq_steps > 0:
-            if self.global_step % self.config.dpmm_update_freq_steps == 0:
-                return buffer.num_filled >= fit_min_samples
-            return False
-        # Buffer-full mode (default)
-        return buffer.is_full()
-
-    def maybe_update_traj_dpmm(self, model) -> bool:
-        """Check if the traj DPMM should update; if so, fit and hot-swap anchors.
-
-        Args:
-            model: The LidarCenterNet model (or DDP-wrapped).
-
-        Returns:
-            True if an update was performed, False otherwise.
+        Each sample is consumed exactly once. If adding a batch would overflow
+        a buffer, the batch is split, the full buffer is fitted immediately,
+        and the remainder continues into the emptied buffer.
         """
-        if not self._should_update(self.traj_buffer, self.config.traj_dpmm_fit_min_samples):
-            return False
-        self._fit_and_swap(
-            dpmm=self.traj_dpmm,
-            buffer=self.traj_buffer,
-            replay_ratio=self.config.traj_dpmm_replay_ratio,
-            max_replay=self.config.traj_dpmm_max_replay_samples,
-            tag='traj',
-            anchor_dim_slice=20,  # traj anchors are 20-dim
-            update_fn=model.update_traj_anchors,
-        )
+        if self.rank != 0:
+            return
+
+        if self.enable_traj and traj_batch is not None:
+            traj_flat = traj_batch.detach().reshape(traj_batch.shape[0], -1)
+            self._consume_stream(
+                buffer=self.traj_buffer,
+                batch=traj_flat,
+                dpmm=self.traj_dpmm,
+                replay_ratio=self.config.traj_dpmm_replay_ratio,
+                max_replay=self.config.traj_dpmm_max_replay_samples,
+                tag='traj',
+                anchor_dim_slice=20,
+            )
+
+        if self.enable_fusefeat and fusefeat_batch is not None:
+            fusefeat_flat = fusefeat_batch.detach().reshape(fusefeat_batch.shape[0], -1)
+            self._consume_stream(
+                buffer=self.fusefeat_buffer,
+                batch=fusefeat_flat,
+                dpmm=self.fusefeat_dpmm,
+                replay_ratio=self.config.fusefeat_dpmm_replay_ratio,
+                max_replay=self.config.fusefeat_dpmm_max_replay_samples,
+                tag='fusefeat',
+                anchor_dim_slice=None,
+            )
+
+    def _consume_stream(self, buffer, batch, dpmm, replay_ratio,
+                        max_replay, tag, anchor_dim_slice) -> None:
+        """Consume a CPU/GPU batch without dropping samples at wraparound."""
+        batch = batch.detach().to(dtype=torch.float32).cpu()
+        if batch.ndim != 2 or batch.shape[1] != buffer.data_dim:
+            raise ValueError(
+                f"Expected {tag} batch (N, {buffer.data_dim}), got {tuple(batch.shape)}"
+            )
+
+        offset = 0
+        while offset < batch.shape[0]:
+            if buffer.is_full():
+                self._fit_local_buffer(
+                    dpmm, buffer, replay_ratio, max_replay, tag, anchor_dim_slice)
+
+            free_slots = buffer.capacity - buffer.num_filled
+            take = min(free_slots, batch.shape[0] - offset)
+            buffer.add_batch(batch[offset:offset + take])
+            offset += take
+
+            if buffer.is_full():
+                self._fit_local_buffer(
+                    dpmm, buffer, replay_ratio, max_replay, tag, anchor_dim_slice)
+
+    def _fit_local_buffer(self, dpmm, buffer, replay_ratio, max_replay,
+                          tag, anchor_dim_slice):
+        """Fit one DPMM buffer locally on rank 0 and reset the buffer."""
+        if self.rank != 0 or buffer.num_filled == 0:
+            return None
+
+        buffer_data = buffer.get_all()
+        fit_data = self._mix_replay(dpmm, buffer_data, replay_ratio, max_replay)
+        fit_data = purge_invalid_values(fit_data, f"{tag}_dpmm_fit")
+
+        if fit_data.shape[0] == 0:
+            print(f"[OnlineDPMM] Skipping {tag} update: no valid data")
+            buffer.reset()
+            return None
+
+        print(f"[OnlineDPMM] Fitting {tag} DPMM with {fit_data.shape[0]} samples "
+              f"(buffer={buffer_data.shape[0]}, task={self.current_task}, "
+              f"step={self.global_step})")
+        dpmm.fit(fit_data)
+        new_anchors = self._extract_anchors(dpmm, anchor_dim_slice)
+        self.tag_update_counts[tag] += 1
+        self._log_dpmm_state(dpmm, tag)
         self.update_count += 1
-        return True
-
-    def maybe_update_fusefeat_dpmm(self, model) -> bool:
-        """Check if the fuseFeat DPMM should update; if so, fit and hot-swap.
-
-        Args:
-            model: The LidarCenterNet model (or DDP-wrapped).
-
-        Returns:
-            True if an update was performed, False otherwise.
-        """
-        if not self._should_update(self.fusefeat_buffer, self.config.fusefeat_dpmm_fit_min_samples):
-            return False
-        self._fit_and_swap(
-            dpmm=self.fusefeat_dpmm,
-            buffer=self.fusefeat_buffer,
-            replay_ratio=self.config.fusefeat_dpmm_replay_ratio,
-            max_replay=self.config.fusefeat_dpmm_max_replay_samples,
-            tag='fusefeat',
-            anchor_dim_slice=None,  # fuseFeat anchors use full mu
-            update_fn=model.update_fusefeat_anchors,
-        )
-        self.update_count += 1
-        return True
-
-    # ------------------------------------------------------------------
-    # Core fit + broadcast + hot-swap
-    # ------------------------------------------------------------------
-
-    def _fit_and_swap(self, dpmm, buffer, replay_ratio, max_replay,
-                      tag, anchor_dim_slice, update_fn) -> None:
-        """Fit a DPMM on rank 0, broadcast new anchors, and hot-swap into model.
-
-        The buffer is reset AFTER the fit so it doesn't re-trigger on the
-        very next step.
-
-        Args:
-            dpmm: BNPModel instance.
-            buffer: TensorRingBuffer with data to fit on.
-            replay_ratio: Ratio of replay samples to mix with buffer data.
-            max_replay: Maximum number of replay samples.
-            tag: 'traj' or 'fusefeat' (for logging).
-            anchor_dim_slice: If not None, slice mu to first N dims (traj=20).
-            update_fn: Model method to call with new anchors.
-        """
-        # Only rank 0 needs to prepare data and fit; other ranks just
-        # need to participate in the collective broadcast below.
-        new_anchors = None
-        if self.rank == 0:
-            buffer_data = buffer.get_all()  # (N, dim) on CPU
-            fit_data = self._mix_replay(dpmm, buffer_data, replay_ratio, max_replay)
-            fit_data = purge_invalid_values(fit_data, f"{tag}_dpmm_fit")
-
-            if fit_data.shape[0] == 0:
-                print(f"[OnlineDPMM] Skipping {tag} update: no valid data")
-            else:
-                print(f"[OnlineDPMM] Fitting {tag} DPMM with {fit_data.shape[0]} samples "
-                      f"(buffer={buffer_data.shape[0]}, step={self.global_step})")
-                dpmm.fit(fit_data)
-                new_anchors = self._extract_anchors(dpmm, anchor_dim_slice)
-                self._log_dpmm_state(dpmm, tag)
-                print(f"[OnlineDPMM] {tag} DPMM updated: {new_anchors.shape[0]} clusters")
-
-        # Broadcast anchors from rank 0 to all ranks (collective — all
-        # ranks must call this).  If rank 0 had no data, it broadcasts
-        # shape (0, 0) and everyone gets an empty tensor.
-        new_anchors = self._broadcast_anchors(new_anchors)
-
-        # Hot-swap anchors into model (only if we got real anchors)
-        if new_anchors.numel() > 0:
-            update_fn(new_anchors.to(self.device))
-
-        # Reset buffer so it doesn't immediately re-trigger
         buffer.reset()
+        print(f"[OnlineDPMM] {tag} DPMM updated: {new_anchors.shape[0]} clusters")
+        return new_anchors
+
+    def finalize_task(self, model):
+        """Flush partial buffers, broadcast final anchors, and update the model.
+
+        This collective method must be called by every distributed rank after
+        all samples from the current task have been consumed.
+        """
+        traj_anchors = None
+        fusefeat_anchors = None
+
+        if self.rank == 0:
+            if self.enable_traj:
+                self._fit_local_buffer(
+                    self.traj_dpmm, self.traj_buffer,
+                    self.config.traj_dpmm_replay_ratio,
+                    self.config.traj_dpmm_max_replay_samples,
+                    'traj', 20)
+                traj_anchors = self._extract_anchors(self.traj_dpmm, 20)
+
+            if self.enable_fusefeat:
+                self._fit_local_buffer(
+                    self.fusefeat_dpmm, self.fusefeat_buffer,
+                    self.config.fusefeat_dpmm_replay_ratio,
+                    self.config.fusefeat_dpmm_max_replay_samples,
+                    'fusefeat', None)
+                fusefeat_anchors = self._extract_anchors(self.fusefeat_dpmm, None)
+
+        result = {}
+        if self.enable_traj:
+            traj_anchors = self._broadcast_anchors(traj_anchors)
+            if traj_anchors.numel() == 0:
+                raise RuntimeError(
+                    f"Trajectory DPMM produced no anchors for task {self.current_task}."
+                )
+            model.update_traj_anchors(traj_anchors.to(self.device))
+            result['traj'] = tuple(traj_anchors.shape)
+
+        if self.enable_fusefeat:
+            fusefeat_anchors = self._broadcast_anchors(fusefeat_anchors)
+            if fusefeat_anchors.numel() == 0:
+                raise RuntimeError(
+                    f"Fuse-feature DPMM produced no anchors for task {self.current_task}."
+                )
+            model.update_fusefeat_anchors(fusefeat_anchors.to(self.device))
+            result['fusefeat'] = tuple(fusefeat_anchors.shape)
+
+        if self.rank == 0:
+            print(f"[OnlineDPMM] Frozen anchors ready for {self.current_task}: {result}")
+        self.anchors_ready_for_task = True
+        return result
 
     def _mix_replay(self, dpmm, buffer_data, replay_ratio, max_replay):
         """Mix buffer data with replay samples from the existing DPMM.
@@ -354,9 +334,10 @@ class OnlineDPMMManager:
         )
         tracked = convert_tensor_to_list(tracked)
 
+        update_index = self.tag_update_counts.get(tag, 0)
         path = os.path.join(
             self.logdir, self.config.dpmm_log_dir, tag,
-            f"step{self.global_step:06d}-tracked_clusters.json",
+            f"step{self.global_step:06d}-update{update_index:04d}-tracked_clusters.json",
         )
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(tracked, f, indent=2)
@@ -365,7 +346,7 @@ class OnlineDPMMManager:
         components = sorted(dpmm.components, key=lambda x: x['k'])
         comp_path = os.path.join(
             self.logdir, self.config.dpmm_log_dir, tag,
-            f"step{self.global_step:06d}-components.json",
+            f"step{self.global_step:06d}-update{update_index:04d}-components.json",
         )
         with open(comp_path, 'w', encoding='utf-8') as f:
             json.dump(components, f, indent=2)

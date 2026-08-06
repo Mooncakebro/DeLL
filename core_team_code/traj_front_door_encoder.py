@@ -134,11 +134,11 @@ class TrajFrontDoorEncoder(nn.Module):
         """
         Creates diverse trajectory anchors covering common driving maneuvers.
         When no valid path/file is found, creates a single random placeholder
-        that will be replaced by the online DPMM once the buffer fills.
+        that will be replaced during the pre-task DPMM preparation phase.
         """
         if anchor_path is None or not os.path.isfile(anchor_path):
             print(f'[TrajFrontDoor] No valid anchor path ({anchor_path}). '
-                  f'Creating random placeholder (will be replaced by DPMM).')
+                  f'Creating random placeholder (replaced before task training).')
             anchors = torch.randn(1, 20, dtype=torch.float32) * 0.01
             self.register_buffer('anchors', anchors)
             print(f'[TrajFrontDoor] Created {anchors.shape[0]} random placeholder anchors')
@@ -243,4 +243,6 @@ class TrajFrontDoorEncoder(nn.Module):
                 f"existing={self.anchors.shape[1]}"
             )
         device = self.anchors.device
-        self.anchors = new_anchors.to(device)
+        with torch.inference_mode(False):
+            self.anchors = new_anchors.detach().clone().to(
+                device=device, dtype=self.anchors.dtype)

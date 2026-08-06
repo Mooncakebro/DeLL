@@ -1,12 +1,12 @@
 '''
-Online alternating Network-DPMM training script.
+Task-boundary Network-DPMM training script.
 
-This script extends ``my_train_ability_wTFFdeQtd.py`` to co-train the
-TransFuser++ network with two DPMM knowledge spaces (trajectory anchors and
-fused-feature anchors) inside a single training loop.  When a DPMM's ring
-buffer fills, the DPMM is fitted (on rank 0), new anchors are broadcast to
-all ranks, and the model's decoders/encoders are hot-swapped — all without
-interrupting the training loop.
+This script extends ``my_train_ability_wTFFdeQtd.py`` with two DPMM knowledge
+spaces (trajectory anchors and fused-feature anchors). Before each ability is
+optimized, the complete ability dataset is streamed through bounded buffers.
+Rank 0 continuously fits each DPMM whenever its buffer fills, flushes the final
+partial buffers, and broadcasts the resulting anchors once. The anchors then
+remain frozen for the full model-training phase of that ability.
 
 Usage (2-GPU example)::
 
@@ -18,11 +18,10 @@ Usage (2-GPU example)::
         --id exp_online_000 --cpu_cores 8 --online_dpmm 1
 
 Key differences from the original script:
-    - ``--online_dpmm 1`` enables the online alternating DPMM mode.
-    - Two ring buffers (traj + fuseFeat) are filled every batch.
-    - When a buffer fills, the corresponding DPMM is fitted and anchors are
-      hot-swapped into the model.
-    - No separate offline DPMM fitting scripts are needed.
+    - ``--online_dpmm 1`` enables task-boundary DPMM preparation.
+    - Every task sample is sent to both DPMMs before model optimization.
+    - Ring buffers bound memory while allowing continuous DPMM updates.
+    - Final anchors are frozen throughout the task's model-training epochs.
 '''
 
 import argparse
@@ -40,7 +39,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -218,11 +217,9 @@ def main():
 
     # --- Online DPMM arguments ---
     parser.add_argument('--online_dpmm', type=int, default=int(config.online_dpmm),
-                        help='0=static anchors (old mode), 1=online alternating DPMM mode.')
+                        help='0=static anchors, 1=prepare DPMMs before each task.')
     parser.add_argument('--traj_dpmm_buffer_size', type=int, default=config.traj_dpmm_buffer_size)
     parser.add_argument('--fusefeat_dpmm_buffer_size', type=int, default=config.fusefeat_dpmm_buffer_size)
-    parser.add_argument('--dpmm_update_start_step', type=int, default=config.dpmm_update_start_step)
-    parser.add_argument('--dpmm_update_freq_steps', type=int, default=config.dpmm_update_freq_steps)
     parser.add_argument('--traj_dpmm_replay_ratio', type=float, default=config.traj_dpmm_replay_ratio)
     parser.add_argument('--fusefeat_dpmm_replay_ratio', type=float,
                         default=config.fusefeat_dpmm_replay_ratio)
@@ -275,7 +272,7 @@ def main():
                                           init_method='env://',
                                           world_size=world_size,
                                           rank=rank,
-                                          timeout=datetime.timedelta(minutes=15))
+                                          timeout=datetime.timedelta(hours=6))
 
     ncpus_per_node = args.cpu_cores
     num_workers = int(ncpus_per_node / ngpus_per_node)
@@ -286,6 +283,18 @@ def main():
 
     config.initialize(**vars(args))
     config.debug = int(os.environ.get('DEBUG_CHALLENGE', 0))
+
+    if config.online_dpmm:
+        if config.use_plant:
+            raise ValueError('Task-boundary DPMM preparation requires LidarCenterNet, not PlanT.')
+        if not config.use_controller_input_prediction:
+            raise ValueError(
+                'Task-boundary DPMM preparation requires controller-input prediction.'
+            )
+        if config.use_prior_fuseFeat and not config.transformer_decoder_join:
+            raise ValueError(
+                'Fuse-feature DPMM preparation requires transformer_decoder_join=1.'
+            )
 
     # --- Loss weight setup (same as original) ---
     if config.use_plant:
@@ -450,13 +459,10 @@ def main():
             config=config, logdir=args.logdir, device=device,
             rank=rank, world_size=world_size)
         if rank == 0:
-            print(f'[OnlineDPMM] Enabled online alternating DPMM training.')
-            print(f'  Traj buffer:    {config.traj_dpmm_buffer_size} samples, '
-                  f'fit_min={config.traj_dpmm_fit_min_samples}')
-            print(f'  FuseFeat buffer: {config.fusefeat_dpmm_buffer_size} samples, '
-                  f'fit_min={config.fusefeat_dpmm_fit_min_samples}')
-            print(f'  Update start step: {config.dpmm_update_start_step}, '
-                  f'freq: {config.dpmm_update_freq_steps}')
+            print('[OnlineDPMM] Enabled task-boundary DPMM preparation.')
+            print(f'  Traj buffer:     {config.traj_dpmm_buffer_size} samples')
+            print(f'  FuseFeat buffer: {config.fusefeat_dpmm_buffer_size} samples')
+            print('  Anchors are prepared before each task and frozen during training.')
 
     # --- Engine with sequential ability training ---
     ability_list = getattr(config, 'selected_ability_list',
@@ -558,6 +564,13 @@ def main():
         trainer.dataloader_val = dataloader_val
         trainer.iters_per_epoch = len(dataloader_train)
 
+        if online_dpmm_manager is not None:
+            trainer.prepare_dpmm_for_task(
+                dataset=train_set,
+                ability_name=ability_name,
+                num_workers=num_workers,
+            )
+
         for epoch in range(0, epochs_per_ability):
             print(f'[{ability_name}] Epoch {epoch}, lr: {scheduler.get_last_lr()}')
             sampler_train.set_epoch(epoch)
@@ -594,12 +607,11 @@ def main():
 # ======================================================================
 
 class OnlineEngine(object):
-    """Training engine with online alternating DPMM support.
+    """Training engine with task-boundary DPMM preparation.
 
     This extends the original ``Engine`` from ``my_train_ability_wTFFdeQtd.py``
-    by integrating ``OnlineDPMMManager`` into the training loop.  When
-    ``online_dpmm_manager`` is None, it behaves identically to the original
-    engine.
+    by preparing stable anchors before each task. When
+    ``online_dpmm_manager`` is None, it behaves like the original engine.
     """
 
     def __init__(self, model, optimizer, dataloader_train, dataloader_val,
@@ -633,6 +645,131 @@ class OnlineEngine(object):
 
         self.detailed_loss_weights = config.detailed_loss_weights
         self.ability_logdir = args.logdir  # overridden per ability
+
+    def _extract_fusefeat_batch(self, data):
+        """Run an inference-only forward pass and return raw joined features."""
+        if self.config.use_plant:
+            raise RuntimeError('Fuse-feature DPMM preparation does not support PlanT.')
+
+        model_module = self.model.module
+        target_point = data['target_point'].to(self.device, dtype=torch.float32)
+        target_point_next = data['target_point_next'].to(self.device, dtype=torch.float32)
+        command = data['command'].to(self.device, dtype=torch.float32)
+        ego_vel = data['speed'].to(self.device, dtype=torch.float32).unsqueeze(1)
+        rgb = data['rgb'].to(self.device, dtype=torch.float32)
+        if self.config.lidar_seq_len > 1:
+            lidar = data['temporal_lidar'].to(self.device, dtype=torch.float32)
+        else:
+            lidar = data['lidar'].to(self.device, dtype=torch.float32)
+
+        model_module.last_joined_features = None
+        with torch.inference_mode():
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=bool(self.config.use_amp)):
+                model_module(
+                    rgb=rgb,
+                    lidar_bev=lidar,
+                    target_point=target_point,
+                    ego_vel=ego_vel,
+                    command=command,
+                    target_point_next=(target_point_next
+                                       if self.config.two_tp_input else None),
+                )
+
+        joined_features = model_module.last_joined_features
+        if joined_features is None:
+            raise RuntimeError(
+                'Model did not expose last_joined_features during DPMM preparation.'
+            )
+        with torch.inference_mode(False):
+            return joined_features.detach().cpu().clone()
+
+    def prepare_dpmm_for_task(self, dataset, ability_name, num_workers):
+        """Consume a complete task dataset, then install stable final anchors."""
+        manager = self.online_dpmm_manager
+        if manager is None:
+            return
+
+        manager.begin_task(ability_name)
+        was_training = self.model.training
+        self.model.eval()
+
+        shard_indices = range(self.rank, len(dataset), self.world_size)
+        shard = Subset(dataset, shard_indices)
+        generator = torch.Generator(device='cpu')
+        generator.manual_seed((self.args.seed or 0) + self.rank)
+        dataloader = DataLoader(
+            shard,
+            shuffle=False,
+            batch_size=self.args.batch_size,
+            worker_init_fn=seed_worker,
+            generator=generator,
+            num_workers=num_workers,
+            pin_memory=False,
+            drop_last=False,
+        )
+
+        local_num_batches = torch.tensor([len(dataloader)], dtype=torch.long,
+                                         device=self.device)
+        torch.distributed.all_reduce(local_num_batches, op=torch.distributed.ReduceOp.MAX)
+        max_num_batches = int(local_num_batches.item())
+        data_iterator = iter(dataloader)
+
+        if self.rank == 0:
+            print(f'[OnlineDPMM] Streaming all {len(dataset)} samples for {ability_name} '
+                  f'across {self.world_size} rank(s).')
+
+        for _ in tqdm(range(max_num_batches), disable=self.rank != 0,
+                      desc=f'DPMM {ability_name}'):
+            try:
+                data = next(data_iterator)
+            except StopIteration:
+                data = None
+
+            if data is None:
+                traj_batch = torch.empty(0, self.config.predict_checkpoint_len * 2)
+                fusefeat_batch = torch.empty(
+                    0, self.config.gru_input_size * (self.config.predict_checkpoint_len + 1))
+            else:
+                traj_batch = data['route'][:, :self.config.predict_checkpoint_len].reshape(
+                    data['route'].shape[0], -1).to(dtype=torch.float32)
+                if manager.enable_fusefeat:
+                    fusefeat_batch = self._extract_fusefeat_batch(data)
+                else:
+                    fusefeat_batch = torch.empty(
+                        0, self.config.gru_input_size * (self.config.predict_checkpoint_len + 1))
+
+            payload = (traj_batch.cpu(), fusefeat_batch.cpu())
+            if self.world_size > 1:
+                gathered_payloads = [None] * self.world_size if self.rank == 0 else None
+                torch.distributed.gather_object(payload, gathered_payloads, dst=0)
+            else:
+                gathered_payloads = [payload]
+
+            if self.rank == 0:
+                manager.step()
+                for gathered_traj, gathered_fusefeat in gathered_payloads:
+                    manager.consume_task_batch(
+                        traj_batch=gathered_traj if gathered_traj.numel() > 0 else None,
+                        fusefeat_batch=(gathered_fusefeat
+                                        if gathered_fusefeat.numel() > 0 else None),
+                    )
+
+        anchor_shapes = manager.finalize_task(self.model.module)
+        if self.rank == 0:
+            manager.save()
+            if self.writer is not None:
+                if 'traj' in anchor_shapes:
+                    self.writer.add_scalar(
+                        f'dpmm/{ability_name}_traj_num_clusters',
+                        anchor_shapes['traj'][0], manager.global_step)
+                if 'fusefeat' in anchor_shapes:
+                    self.writer.add_scalar(
+                        f'dpmm/{ability_name}_fusefeat_num_clusters',
+                        anchor_shapes['fusefeat'][0], manager.global_step)
+
+        torch.distributed.barrier()
+        self.model.train(was_training)
 
     # ------------------------------------------------------------------
     # load_data_compute_loss (same as original)
@@ -755,10 +892,13 @@ class OnlineEngine(object):
         return losses, metrics
 
     # ------------------------------------------------------------------
-    # Train loop (with online DPMM integration)
+    # Train loop (anchors remain frozen for the whole task)
     # ------------------------------------------------------------------
 
     def train(self):
+        if (self.online_dpmm_manager is not None
+                and not self.online_dpmm_manager.anchors_ready_for_task):
+            raise RuntimeError('Model training cannot start before DPMM anchors are finalized.')
         self.model.train()
         num_batches = 0
         loss_epoch = 0.0
@@ -792,43 +932,6 @@ class OnlineEngine(object):
 
             num_batches += 1
             loss_epoch += float(loss.item())
-
-            # --- Online DPMM: fill buffers and maybe update ---
-            if self.online_dpmm_manager is not None:
-                self.online_dpmm_manager.step()
-
-                # 1. Fill traj buffer with ground-truth routes
-                traj_data = data['route'][:, :self.config.predict_checkpoint_len]
-                self.online_dpmm_manager.fill_traj_buffer(traj_data)
-
-                # 2. Fill fuseFeat buffer with model's last_joined_features
-                model_module = self.model.module
-                if hasattr(model_module, 'last_joined_features') and model_module.last_joined_features is not None:
-                    self.online_dpmm_manager.fill_fusefeat_buffer(model_module.last_joined_features)
-
-                # 3. Maybe update traj DPMM
-                traj_updated = self.online_dpmm_manager.maybe_update_traj_dpmm(model_module)
-
-                # 4. Maybe update fuseFeat DPMM
-                fusefeat_updated = self.online_dpmm_manager.maybe_update_fusefeat_dpmm(model_module)
-
-                # Log DPMM stats
-                if self.rank == 0 and self.writer is not None:
-                    self.writer.add_scalar('dpmm/traj_buffer_filled',
-                                           float(self.online_dpmm_manager.traj_buffer.num_filled),
-                                           self.online_dpmm_manager.global_step)
-                    self.writer.add_scalar('dpmm/fusefeat_buffer_filled',
-                                           float(self.online_dpmm_manager.fusefeat_buffer.num_filled),
-                                           self.online_dpmm_manager.global_step)
-                    self.writer.add_scalar('dpmm/traj_num_clusters',
-                                           float(len(self.online_dpmm_manager.traj_dpmm.components)),
-                                           self.online_dpmm_manager.global_step)
-                    self.writer.add_scalar('dpmm/fusefeat_num_clusters',
-                                           float(len(self.online_dpmm_manager.fusefeat_dpmm.components)),
-                                           self.online_dpmm_manager.global_step)
-                    self.writer.add_scalar('dpmm/update_count',
-                                           float(self.online_dpmm_manager.update_count),
-                                           self.online_dpmm_manager.global_step)
 
             if self.config.use_cosine_schedule:
                 self.scheduler.step(self.cur_epoch + i / self.iters_per_epoch)

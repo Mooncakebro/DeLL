@@ -357,10 +357,8 @@ class BNPModel:
         Returns:
             Tensor of samples with shape (num_samples, latent_dim)
         """
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        mu = self.comp_mu[component].to(device)
-        var = self.comp_var[component].to(device)
+        mu = self.comp_mu[component].cpu()
+        var = self.comp_var[component].cpu()
         
         # # Create diagonal covariance matrix
         # cov = torch.diag_embed(var)
@@ -391,13 +389,11 @@ class BNPModel:
         Returns:
             Tensor of samples with shape (total_samples, latent_dim)
         """
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
         num_comps = len(self.comp_mu)       # Number of active components
-        latent_dim = len(self.comp_mu[0])   # Dimension of latent variable
-        
         if num_comps == 0:
-            return torch.empty((0, latent_dim)).to(device)
+            return torch.empty((0, 0), dtype=torch.float32)
+
+        latent_dim = len(self.comp_mu[0])   # Dimension of latent variable
         
         # Calculate samples per component (at least 1 per component)
         samples_per_comp = max(1, num_samples // num_comps)
@@ -415,7 +411,7 @@ class BNPModel:
             idx = torch.randperm(len(z))[:num_samples]
             z = z[idx]
         
-        return z.to(device)  # Ensure output is on correct device
+        return z
     
     def save_model_and_info_dict_for_eval(self):
         pass
@@ -621,7 +617,6 @@ class BNPModel:
         
         # Base types pass through
         return obj
-
 
 
 

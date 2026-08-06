@@ -453,7 +453,7 @@ class GlobalConfig:
     # -----------------------------------------------------------------------------
     self.local_rank = -999
     self.id = 'transfuser'  # Unique experiment identifier.
-    self.epochs = 31  # Number of epochs to train
+    self.epochs = 30  # Number of model-training epochs per ability
     self.lr = 3e-4  # Learning rate used for training
     self.batch_size = 16  # Batch size used during training
     self.logdir = ''  # Directory to log data to.
@@ -1055,15 +1055,14 @@ class GlobalConfig:
     self.ff_dropout = 0.1  # dropout率
 
     # -----------------------------------------------------------------------------
-    # Online alternating Network-DPMM training
+    # Task-boundary Network-DPMM training
     # -----------------------------------------------------------------------------
-    # Master switch: 0 = old static-anchor mode (3-stage pipeline),
-    #                1 = online alternating mode (network + 2 DPMMs co-train).
+    # Master switch: 0 = static-anchor mode,
+    #                1 = fit DPMMs before each task, then freeze anchors.
     self.online_dpmm = 0
 
     # Traj DPMM buffer (ground-truth routes from dataset, 20-dim)
     self.traj_dpmm_buffer_size = 4096
-    self.traj_dpmm_fit_min_samples = 512
     self.traj_dpmm_gamma0 = 500.0
     self.traj_dpmm_num_lap = 100
     self.traj_dpmm_sF = 1e-5
@@ -1072,16 +1071,12 @@ class GlobalConfig:
 
     # FuseFeat DPMM buffer (model.last_joined_features, 2816-dim)
     self.fusefeat_dpmm_buffer_size = 2048
-    self.fusefeat_dpmm_fit_min_samples = 256
     self.fusefeat_dpmm_gamma0 = 500.0
     self.fusefeat_dpmm_num_lap = 100
     self.fusefeat_dpmm_sF = 1e-5
     self.fusefeat_dpmm_replay_ratio = 0.5
     self.fusefeat_dpmm_max_replay_samples = 3000
 
-    # Schedule
-    self.dpmm_update_start_step = 200  # Don't fit DPMM until this many steps
-    self.dpmm_update_freq_steps = 0    # 0 = only update when buffer fills; >0 = also update every N steps
     self.dpmm_log_dir = "dpmm_online"  # Subdirectory under logdir for DPMM artifacts
 
   def initialize(self, root_dir='', setting='all', **kwargs):

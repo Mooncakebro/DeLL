@@ -1,6 +1,6 @@
 #!/bin/bash
 # =====================================================================
-# Shell script for online alternating Network-DPMM training (1 GPU).
+# Shell script for task-boundary Network-DPMM training (1 GPU).
 #
 # Usage:
 #   bash core_team_code/online_dpmm/my_shell_train_online_dpmm_1gpu.sh
@@ -36,7 +36,7 @@ LOAD_FILE=${PROJECT_ROOT}/Dell_material/pretrain_backbone_stg1/model_0030.pth
 CMD="torchrun --nnodes=1 --nproc_per_node=1 --max_restarts=1 --rdzv_id=251122 --rdzv_backend=c10d \
   core_team_code/online_dpmm/my_train_ability_wTFFdeQtd_online.py \
   --id ${EXP_ID} \
-  --use_disk_cache 0 --crop_image 1 --seed 0 --epochs 31 --batch_size 2 --lr 3e-4 --setting all \
+  --use_disk_cache 0 --crop_image 1 --seed 0 --epochs 30 --batch_size 2 --lr 3e-4 --setting all \
   --root_dir ${DATASET_ROOT} \
   --logdir ${LOGDIR} \
   --use_controller_input_prediction 1 --use_wp_gru 0 --cpu_cores 4 \
@@ -47,8 +47,6 @@ CMD="torchrun --nnodes=1 --nproc_per_node=1 --max_restarts=1 --rdzv_id=251122 --
   --use_prior_fuseFeat 1 \
   --traj_dpmm_buffer_size 5000 \
   --fusefeat_dpmm_buffer_size 5000 \
-  --dpmm_update_start_step 200 \
-  --dpmm_update_freq_steps 0 \
   --traj_dpmm_replay_ratio 0.5 \
   --fusefeat_dpmm_replay_ratio 0.5"
 

@@ -14,7 +14,7 @@
 
 ## Overview
 
-**DeLL** is a continual learning framework for end-to-end autonomous driving, built on top of the [CARLA Garage](https://github.com/autonomousvision/carla_garage) (TransFuser++) codebase. It addresses catastrophic forgetting in multi-ability driving scenarios by co-training the neural network with two **Dirichlet Process Mixture Model (DPMM)** knowledge spaces — one for trajectory anchors and one for fused-feature anchors — that are updated *online* during training.
+**DeLL** is a continual learning framework for end-to-end autonomous driving, built on top of the [CARLA Garage](https://github.com/autonomousvision/carla_garage) (TransFuser++) codebase. It addresses catastrophic forgetting in multi-ability driving scenarios with two **Dirichlet Process Mixture Model (DPMM)** knowledge spaces — one for trajectory anchors and one for fused-feature anchors — that are updated at task boundaries before model optimization.
 
 ### Key Ideas
 
@@ -22,7 +22,7 @@
 
 2. **Front-door encoders.** Two optional encoder modules (`TrajFrontDoorEncoder`, `FuseFeatFrontDoorEncoder`) enhance the model's intermediate features by cross-attending to DPMM anchors, using a gated fusion to blend augmented and original features.
 
-3. **Online alternating training.** Two ring buffers collect ground-truth routes and model features every batch. When a buffer fills, the corresponding DPMM is fitted on rank 0, new anchors are broadcast to all ranks, and the model's decoder/encoder anchor buffers are hot-swapped — all without interrupting the training loop.
+3. **Stable task-boundary anchors.** Before each ability is trained, its complete dataset is streamed through two bounded ring buffers. Rank 0 updates each DPMM whenever its buffer fills and flushes the final partial buffer. The final clusters are then broadcast once and kept frozen for all model-training epochs of that ability, so random placeholders and changing clusters never participate in gradient optimization.
 
 4. **Sequential ability training.** The model is trained sequentially across 5 driving abilities (`Emergency_Brake → Traffic_Sign → Merging → Overtaking → Give_Way`), enabling evaluation of lifelong learning metrics such as forgetting, forward transfer, and backward transfer.
 
@@ -121,13 +121,13 @@ After downloading, place the `Dell_material/` folder at the project root. The `-
 
 ## Training
 
-Training is done in two stages: (1) perception pre-training (Stage 1, you can directly use the pre-trained weight in /Dell_material. Note that to get better overall performance, you can keep the backbone trainable on the 1st task (EmgBrake) and freeze it since the 2nd task (Tsign). Though freeze it since the 1st task would make the process easier.) and (2) online alternating Network-DPMM training (Stage 2).
+Training is done in two stages: (1) perception pre-training (Stage 1, you can directly use the pre-trained weight in /Dell_material. Note that to get better overall performance, you can keep the backbone trainable on the 1st task (EmgBrake) and freeze it since the 2nd task (Tsign). Though freeze it since the 1st task would make the process easier.) and (2) task-boundary Network-DPMM training (Stage 2).
 
 ### Stage 1: Perception Pre-training
 
 Follow the original training instructions in the [CARLA Garage README](https://github.com/autonomousvision/carla_garage). Use `team_code/train.py` with `--use_controller_input_prediction 0` to pre-train the backbone. The resulting checkpoint (e.g., `model_0030.pth`) will be used as the `--load_file` for Stage 2.
 
-### Stage 2: Online DPMM Training
+### Stage 2: Task-Boundary DPMM Training
 
 The main training script is `core_team_code/online_dpmm/my_train_ability_wTFFdeQtd_online.py`. A ready-to-use shell script for single-GPU training is provided:
 
@@ -150,14 +150,25 @@ bash core_team_code/online_dpmm/my_shell_train_online_dpmm_1gpu.sh
 
 | Argument | Default | Description |
 |---|---|---|
-| `--online_dpmm` | `1` | Enable online alternating DPMM mode |
+| `--online_dpmm` | `0` | Set to `1` to prepare both DPMMs before each ability and freeze the resulting anchors during model training |
 | `--use_traj_front_door_encoder` | `1` | Enable trajectory front-door encoder |
 | `--use_prior_fuseFeat` | `1` | Enable fused-feature front-door encoder |
-| `--traj_dpmm_buffer_size` | `500` | Trajectory DPMM ring buffer size |
-| `--fusefeat_dpmm_buffer_size` | `500` | Fused-feature DPMM ring buffer size |
-| `--dpmm_update_start_step` | `200` | Minimum steps before first DPMM fit |
-| `--epochs` | `31` | Epochs *per ability* (total = 31 × 5 = 155) |
+| `--traj_dpmm_buffer_size` | `4096` | Maximum trajectory samples held before an incremental DPMM fit |
+| `--fusefeat_dpmm_buffer_size` | `2048` | Maximum fused-feature samples held before an incremental DPMM fit |
+| `--traj_dpmm_replay_ratio` | `0.5` | Replay ratio used while updating the trajectory DPMM across tasks |
+| `--fusefeat_dpmm_replay_ratio` | `0.5` | Replay ratio used while updating the fused-feature DPMM across tasks |
+| `--epochs` | `30` | Model-training epochs *per ability* after its anchors are finalized |
 | `--freeze_backbone` | `1` | Freeze backbone (use Stage 1 weights) |
+
+For every ability, the script now runs these phases in order:
+
+1. Split the ability dataset into non-overlapping distributed shards.
+2. Send every ground-truth route and raw joined feature through the DPMMs exactly once.
+3. Fit a DPMM whenever its bounded buffer becomes full, then fit the final partial buffer.
+4. Broadcast the final trajectory and fused-feature cluster means to every rank.
+5. Train the model for 30 epochs with those anchors fixed.
+
+The same procedure is repeated for the next ability. Existing DPMM components are retained and replayed while the new task data is consumed. The random one-anchor tensors created during model construction are therefore used only as initialization placeholders during the inference-only feature pass; they are replaced before the first optimizer step.
 
 **Multi-GPU training** (example with 2 GPUs):
 
@@ -170,7 +181,7 @@ torchrun --nnodes=1 --nproc_per_node=2 --max_restarts=0 \
     --id exp_online_000 --cpu_cores 8 --online_dpmm 1
 ```
 
-The model trains sequentially across 5 abilities. For each ability, checkpoints are saved to `logdir/<exp_id>/<ability_name>/`. TensorBoard logs (losses, DPMM stats) are written to `logdir/<exp_id>/`.
+The model trains sequentially across 5 abilities. For each ability, checkpoints remain in `logdir/<exp_id>/<ability_name>/`, including `model_XXXX.pth` and `latest.pth`, so the existing evaluation scripts remain unchanged. DPMM models and cluster snapshots remain under `logdir/<exp_id>/dpmm_online/{traj,fusefeat}/`. TensorBoard logs are written to `logdir/<exp_id>/`.
 
 ```Shell
 tensorboard --logdir /path/to/logdir
@@ -267,7 +278,7 @@ Dell/
 │   └── online_dpmm/             # Online DPMM training scripts
 │       ├── my_train_ability_wTFFdeQtd_online.py  # Main training script
 │       ├── my_shell_train_online_dpmm_1gpu.sh     # Training shell script
-│       └── online_dpmm_manager.py                 # DPMM manager
+│       └── online_dpmm_manager.py                 # Pre-task streaming DPMM manager
 ├── bnpy/                        # DPMM library (install with pip install -e .)
 ├── lifelong_metric/             # Lifelong learning metrics
 │   └── forgetting_and_transfer_eval.py
