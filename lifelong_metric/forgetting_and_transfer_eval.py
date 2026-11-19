@@ -1,360 +1,287 @@
+# -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
 
+# Task evaluated by each column of skill_matrix. Pass a different order if yours differs.
+TEST_COLUMN_ORDER = ['Merging', 'Overtaking', 'EmergencyBrake', 'GiveWay', 'TrafficSign']
 
-def calculate_metrics(skill_matrix, learning_order):
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _safe_div(numerator, denominator):
+    """Return nan when the denominator is 0 or non-finite (undefined in the paper)."""
+    if not np.isfinite(denominator) or denominator == 0:
+        return np.nan
+    return numerator / denominator
+
+
+def _nanmean(values):
+    """Mean ignoring nan; nan when every value is nan."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or np.all(np.isnan(arr)):
+        return np.nan
+    return float(np.nanmean(arr))
+
+
+def to_learning_matrix(skill_matrix, learning_order, column_order=None):
     """
-    Calculate forgetting, forward transfer, backward transfer, and process forgetting metrics
-    based on the skill matrix.
+    Reorder the evaluation matrix into R[i, j] = SR_{i+1, j+1} and normalize SR to [0, 1].
 
-    Parameters:
-    skill_matrix (numpy.array): A 5x5 matrix where rows represent the learning state
-                               (after learning the first i+1 tasks) and columns represent
-                               the test skills.
-                               Rows: After learning [EmergencyBrake],
-                                     [EmergencyBrake, TrafficSign],
-                                     [EmergencyBrake, TrafficSign, Merging],
-                                     [EmergencyBrake, TrafficSign, Merging, Overtaking],
-                                     [All 5 tasks]
-                               Columns: [Merging, Overtaking, EmergencyBrake, GiveWay, TrafficSign]
+    Parameters
+    ----------
+    skill_matrix : array-like, shape (N, N)
+        Rows are training stages (row i = evaluation after learning the first i+1 tasks);
+        the task of each column is given by column_order. If column_order is None the
+        columns are assumed to already follow learning_order.
+    learning_order : list[str]
+        Learning order of the tasks, length N.
+    column_order : list[str], optional
+        Task evaluated by each column of skill_matrix.
 
-    Returns:
-    tuple: (forgetting_list, forgetting_avg,
-            forward_transfer_list, forward_transfer_avg,
-            backward_transfer_list, backward_transfer_avg,
-            process_forgetting_list, process_forgetting_avg,
-            forgetting_ratio_list, forgetting_ratio_avg,
-            process_forgetting_ratio_list, process_forgetting_ratio_avg)
+    Returns
+    -------
+    R : ndarray, shape (N, N)
+        Columns reordered to learning_order, success rates normalized to [0, 1].
+    normalized_from_percent : bool
+        True if the input was read as percentages (0-100) and divided by 100.
     """
-    # 定义任务名称到测试索引的映射
-    # 测试顺序(列索引):
-    # 0: Merging, 1: Overtaking, 2: EmergencyBrake, 3: GiveWay, 4: TrafficSign
-    task_to_test_index = {
-        'EmergencyBrake': 2,
-        'TrafficSign': 4,
-        'Merging': 0,
-        'Overtaking': 1,
-        'GiveWay': 3
+    matrix = np.asarray(skill_matrix, dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError("skill_matrix must be 2-D")
+    if matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(
+            "skill_matrix must be square (rows=stages, cols=tasks), got shape %s"
+            % (matrix.shape,)
+        )
+
+    n = matrix.shape[0]
+    if len(learning_order) != n:
+        raise ValueError(
+            "learning_order length (%d) does not match matrix size (%d)"
+            % (len(learning_order), n)
+        )
+
+    if column_order is None:
+        if len(set(learning_order)) != n:
+            raise ValueError("learning_order has duplicate task names, cannot locate columns")
+        ordered = matrix.copy()
+    else:
+        if len(column_order) != n:
+            raise ValueError(
+                "column_order length (%d) does not match matrix size (%d)"
+                % (len(column_order), n)
+            )
+        if set(column_order) != set(learning_order):
+            missing = set(learning_order) - set(column_order)
+            extra = set(column_order) - set(learning_order)
+            raise ValueError(
+                "column_order and learning_order hold different task sets: missing %s, extra %s"
+                % (sorted(missing), sorted(extra))
+            )
+        position = {task: idx for idx, task in enumerate(column_order)}
+        ordered = matrix[:, [position[task] for task in learning_order]]
+
+    # The paper's SR is a 0-1 ratio; normalize percentage input so FT/BT do not inherit that scale.
+    normalized_from_percent = bool(np.nanmax(ordered) > 1.0)
+    if normalized_from_percent:
+        ordered = ordered / 100.0
+
+    return ordered, normalized_from_percent
+
+
+# --------------------------------------------------------------------------- #
+# The four paper metrics (input is the reordered R, 0-based)
+# --------------------------------------------------------------------------- #
+def forgetting_ratio(R):
+    """
+    (10) FR: relative decay of each old task between "just learned" and "all learned".
+
+    Returns (per_task, mean) with per_task of length N in learning order; the last task has
+    no later stage, so it is nan (matching the paper's bound i = 1..N-1).
+    """
+    n = R.shape[0]
+    per_task = [
+        _safe_div(R[i, i] - R[n - 1, i], R[i, i]) for i in range(n - 1)
+    ]
+    per_task.append(np.nan)
+    return per_task, _nanmean(per_task)
+
+
+def process_forgetting_ratio(R):
+    """
+    (11) PFR: oscillation during training relative to the running historical best.
+
+    per_task[j] = 1/(N-j) * sum_{i=j+1}^{N} (H_{i,j} - SR_{i,j}) / H_{i,j}
+    with H_{i,j} = max{ SR_{i',j} | i' = 1..i-1 }; nan terms are skipped.
+    The last task has no later stage, so it is nan.
+    """
+    n = R.shape[0]
+    per_task = []
+    for j in range(n - 1):
+        terms = []
+        for i in range(j + 1, n):
+            # 0-based: all evaluations before stage i are rows 0 .. i-1
+            historical_best = float(np.max(R[:i, j]))
+            terms.append(_safe_div(historical_best - R[i, j], historical_best))
+        per_task.append(_nanmean(terms))
+    per_task.append(np.nan)
+    return per_task, _nanmean(per_task)
+
+
+def forward_transfer(R):
+    """
+    (12) FT: zero-shot capability on not-yet-learned tasks after learning task i.
+
+    per_task[i] = 1/(N-i) * sum_{j=i+1}^{N} SR_{i,j}, i.e. the row mean over unlearned tasks.
+    The last stage (i=N) has no later task, so it is nan.
+    """
+    n = R.shape[0]
+    per_task = [float(np.mean(R[i, i + 1:])) for i in range(n - 1)]
+    per_task.append(np.nan)
+    return per_task, _nanmean(per_task)
+
+
+def backward_transfer(R):
+    """
+    (13) BT: retention (or reverse enhancement) of old tasks after learning later ones.
+
+    per_task[i] = 1/(i-1) * sum_{j=1}^{i-1} SR_{i,j}, i.e. the row mean over past tasks.
+    The first stage has no past task, so it is nan.
+    """
+    n = R.shape[0]
+    per_task = [np.nan]
+    per_task.extend(float(np.mean(R[i, :i])) for i in range(1, n))
+    return per_task, _nanmean(per_task)
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+def calculate_metrics(skill_matrix, learning_order, column_order=TEST_COLUMN_ORDER):
+    """
+    Compute the four continual-learning metrics defined in the paper.
+
+    Returns
+    -------
+    dict:
+        'R'         : reordered performance matrix R[i, j] = SR_{i+1, j+1}
+        'tasks'     : task names in learning order
+        'FR' / 'PFR' / 'FT' / 'BT'
+                    : {'per_task': list[float] (length N, learning order),
+                       'mean': float}
+    """
+    R, normalized_from_percent = to_learning_matrix(skill_matrix, learning_order, column_order)
+    tasks = list(learning_order)
+
+    fr_list, fr_avg = forgetting_ratio(R)
+    pfr_list, pfr_avg = process_forgetting_ratio(R)
+    ft_list, ft_avg = forward_transfer(R)
+    bt_list, bt_avg = backward_transfer(R)
+
+    return {
+        'R': R,
+        'tasks': tasks,
+        'normalized_from_percent': normalized_from_percent,
+        'FR': {'per_task': fr_list, 'mean': fr_avg},
+        'PFR': {'per_task': pfr_list, 'mean': pfr_avg},
+        'FT': {'per_task': ft_list, 'mean': ft_avg},
+        'BT': {'per_task': bt_list, 'mean': bt_avg},
     }
 
-    N = skill_matrix.shape[0]  # 任务数量
 
-    # 确保数据在[0,1]范围内（如果输入是百分比则除以100）
-    if np.max(skill_matrix) > 1.0:
-        print("警告: 检测到输入数据可能为百分比，已自动归一化到[0,1]范围")
-        skill_matrix = skill_matrix / 100.0
+def metrics_to_frame(result, scale=100.0):
+    """Flatten the result into a DataFrame (scale=100 shows percentages)."""
+    tasks = result['tasks']
+    rows = []
+    for metric in ('FR', 'PFR', 'FT', 'BT'):
+        mean_value = result[metric]['mean']
+        rows.append({
+            'Task': 'Overall',
+            'Metric': metric,
+            'Value': None if np.isnan(mean_value) else mean_value * scale,
+        })
+        for task, value in zip(tasks, result[metric]['per_task']):
+            rows.append({
+                'Task': task,
+                'Metric': metric,
+                'Value': None if np.isnan(value) else value * scale,
+            })
+    return pd.DataFrame(rows)
 
-    # ========== 1. 计算遗忘率（每个任务） ==========
-    forgetting_list = []
-    for i in range(N - 1):  # 排除最后一个任务
-        task_name = learning_order[i]
-        test_index = task_to_test_index[task_name]
 
-        # P_i(Δi): 任务i完成训练后的成功率
-        p_i_delta_i = skill_matrix[i, test_index]
+def format_summary(result, scale=100.0):
+    """Build a printable summary string."""
+    arrow = {'FR': 'v', 'PFR': 'v', 'FT': '^', 'BT': '^'}
+    lines = ["===== Paper metrics (Eq.10-13) ====="]
+    for metric in ('FR', 'PFR', 'FT', 'BT'):
+        value = result[metric]['mean'] * scale
+        lines.append("  %-4s %-4s = %8.2f%%" % (metric, arrow[metric], value))
+    return "\n".join(lines)
 
-        # P_i(T): 所有任务训练完成后的最终成功率
-        p_i_T = skill_matrix[N - 1, test_index]
 
-        # F_i = P_i(Δi) - P_i(T)
-        f_i = p_i_delta_i - p_i_T
-        forgetting_list.append(f_i)
+# --------------------------------------------------------------------------- #
+# Input data
+# --------------------------------------------------------------------------- #
 
-    # 为最后一个任务添加np.nan占位
-    forgetting_list.append(np.nan)
+LEARNING_ORDER = ['EmergencyBrake', 'TrafficSign', 'Merging', 'Overtaking', 'GiveWay']
+# LEARNING_ORDER = ['GiveWay', 'Overtaking', 'Merging', 'TrafficSign', 'EmergencyBrake']
 
-    # F = (1/(N-1)) * Σ(F_i) - 只考虑有值的部分
-    valid_forgetting = [f for f in forgetting_list if not np.isnan(f)]
-    forgetting_avg = np.mean(valid_forgetting) if valid_forgetting else np.nan
+# Fill in one entry per method: {method_name: skill_matrix}.
+# If a matrix's columns are not in TEST_COLUMN_ORDER, pass its own column_order below.
+METHOD_MATRICES = {
+    'TF++': [
+        [62.5, 8.89, 40.00, 50.0, 70.00],
+        [42.5, 15.56, 83.33, 50.0, 78.42],
+        [53.75, 11.11, 51.67, 50.0, 74.74],
+        [37.5, 46.67, 21.67, 50.0, 57.37],
+        [35.0, 8.89, 26.67, 50.0, 55.79],
+    ],
+}
 
-    # ========== 1.1 计算遗忘比率（相对值） ==========
-    forgetting_ratio_list = []
-    for i in range(N - 1):  # 排除最后一个任务
-        task_name = learning_order[i]
-        test_index = task_to_test_index[task_name]
 
-        # P_i(Δi): 任务i完成训练后的成功率
-        p_i_delta_i = skill_matrix[i, test_index]
+def summarize_methods(method_matrices, learning_order, column_order=TEST_COLUMN_ORDER,
+                      scale=100.0):
+    """
+    One row per method with its overall FR / PFR / FT / BT.
 
-        # P_i(T): 所有任务训练完成后的最终成功率
-        p_i_T = skill_matrix[N - 1, test_index]
-
-        # 避免除零错误
-        if p_i_delta_i > 0:
-            # FR_i = (P_i(Δi) - P_i(T)) / P_i(Δi)
-            fr_i = (p_i_delta_i - p_i_T) / p_i_delta_i
-        else:
-            fr_i = 0  # 如果初始性能为0，则遗忘比率为0
-
-        forgetting_ratio_list.append(fr_i)
-
-    # 为最后一个任务添加np.nan占位
-    forgetting_ratio_list.append(np.nan)
-
-    # 计算平均遗忘比率 - 只考虑有值的部分
-    valid_forgetting_ratio = [fr for fr in forgetting_ratio_list if not np.isnan(fr)]
-    forgetting_ratio_avg = np.mean(valid_forgetting_ratio) if valid_forgetting_ratio else np.nan
-
-    # ========== 2. 计算后向迁移率（每个任务） ==========
-    forward_transfer_list = [np.nan]  # 第一个任务没有后向迁移率，用np.nan占位
-
-    for i in range(1, N):  # 从第二个任务开始
-        # 前i个任务的平均成功率
-        sum_prev = 0
-        for k in range(i):
-            task_name = learning_order[k]
-            test_index = task_to_test_index[task_name]
-            sum_prev += skill_matrix[k, test_index]
-
-        # FT_i = (1/i) * Σ(P_k(Δk))
-        ft_i = sum_prev / i
-        forward_transfer_list.append(ft_i)
-
-    # FT = (1/(N-1)) * Σ(FT_i) - 只考虑有值的部分
-    valid_forward_transfer = [ft for ft in forward_transfer_list if not np.isnan(ft)]
-    forward_transfer_avg = np.mean(valid_forward_transfer) if valid_forward_transfer else np.nan
-
-    # ========== 3. 计算前向迁移率（每个任务） ==========
-    backward_transfer_list = []
-    for i in range(N - 1):  # 排除最后一个任务（它没有后续任务）
-        # 计算第i个任务对后续任务的影响
-        sum_next = 0
-        count = 0
-
-        for k in range(i + 1, N):  # 从i+1到N-1
-            task_name = learning_order[k]
-            test_index = task_to_test_index[task_name]
-            # Pk(Δi): 在完成第i个任务训练后，测试第k个任务的成功率
-            p_k_delta_i = skill_matrix[i, test_index]
-            sum_next += p_k_delta_i
-            count += 1
-
-        # BTi = (1/count) * Σ(Pk(Δi))
-        bt_i = sum_next / count if count > 0 else 0
-        backward_transfer_list.append(bt_i)
-
-    # 为最后一个任务添加np.nan占位
-    backward_transfer_list.append(np.nan)
-
-    # BT = (1/(N-1)) * Σ(BTi) - 只考虑有值的部分
-    valid_backward_transfer = [bt for bt in backward_transfer_list if not np.isnan(bt)]
-    backward_transfer_avg = np.mean(valid_backward_transfer) if valid_backward_transfer else np.nan
-
-    # ========== 4. 计算过程遗忘率（每个任务） ==========
-    process_forgetting_list = []
-
-    # 对于每个任务j，计算其在所有后续阶段的平均过程遗忘
-    for j in range(N):
-        if j == N - 1:  # 最后一个任务没有后续阶段，无法计算过程遗忘
-            process_forgetting_list.append(np.nan)
-            continue
-
-        # 获取任务j的名称和测试索引
-        task_name_j = learning_order[j]
-        test_index_j = task_to_test_index[task_name_j]
-
-        # 存储任务j在每个后续阶段的过程遗忘
-        pf_values = []
-
-        # 对于每个后续阶段t（t从j+1到N-1）
-        for t in range(j + 1, N):
-            # 当前阶段t对任务j的测试结果
-            current_perf = skill_matrix[t, test_index_j]
-
-            # 历史最佳表现（从阶段0到t-1）
-            historical_best = np.max(skill_matrix[:t, test_index_j])
-
-            # 过程遗忘 = 历史最佳 - 当前表现
-            pf = historical_best - current_perf
-            pf_values.append(pf)
-
-        # 任务j的平均过程遗忘
-        apf_j = np.mean(pf_values) if pf_values else 0
-        process_forgetting_list.append(apf_j)
-
-    # 计算整体平均过程遗忘（排除最后一个任务）
-    valid_process_forgetting = [pf for pf in process_forgetting_list if not np.isnan(pf)]
-    process_forgetting_avg = np.mean(valid_process_forgetting) if valid_process_forgetting else np.nan
-
-    # ========== 4.1 计算过程遗忘比率（相对值） ==========
-    process_forgetting_ratio_list = []
-
-    # 对于每个任务j，计算其在所有后续阶段的平均过程遗忘比率
-    for j in range(N):
-        if j == N - 1:  # 最后一个任务没有后续阶段，无法计算过程遗忘
-            process_forgetting_ratio_list.append(np.nan)
-            continue
-
-        # 获取任务j的名称和测试索引
-        task_name_j = learning_order[j]
-        test_index_j = task_to_test_index[task_name_j]
-
-        # 存储任务j在每个后续阶段的过程遗忘比率
-        pfr_values = []
-
-        # 对于每个后续阶段t（t从j+1到N-1）
-        for t in range(j + 1, N):
-            # 当前阶段t对任务j的测试结果
-            current_perf = skill_matrix[t, test_index_j]
-
-            # 历史最佳表现（从阶段0到t-1）
-            historical_best = np.max(skill_matrix[:t, test_index_j])
-
-            # 避免除零错误
-            if historical_best > 0:
-                # 过程遗忘比率 = (历史最佳 - 当前表现) / 历史最佳
-                pfr = (historical_best - current_perf) / historical_best
-            else:
-                pfr = 0  # 如果历史最佳为0，则过程遗忘比率为0
-
-            pfr_values.append(pfr)
-
-        # 任务j的平均过程遗忘比率
-        apfr_j = np.mean(pfr_values) if pfr_values else 0
-        process_forgetting_ratio_list.append(apfr_j)
-
-    # 计算整体平均过程遗忘比率（排除最后一个任务）
-    valid_process_forgetting_ratio = [pfr for pfr in process_forgetting_ratio_list if not np.isnan(pfr)]
-    process_forgetting_ratio_avg = np.mean(valid_process_forgetting_ratio) if valid_process_forgetting_ratio else np.nan
-
-    return (forgetting_list, forgetting_avg,
-            forward_transfer_list, forward_transfer_avg,
-            backward_transfer_list, backward_transfer_avg,
-            process_forgetting_list, process_forgetting_avg,
-            forgetting_ratio_list, forgetting_ratio_avg,
-            process_forgetting_ratio_list, process_forgetting_ratio_avg)
+    Parameters
+    ----------
+    method_matrices : dict[str, array-like]
+        {method_name: skill_matrix}, each shaped (N, N).
+    learning_order : list[str]
+        Shared learning order of the tasks.
+    column_order : list[str] or None
+        Task of each column of the matrices; None if the columns already follow learning_order.
+    scale : float
+        Use 100 for percentages, 1 for [0, 1] values.
+    """
+    rows = []
+    for name, matrix in method_matrices.items():
+        result = calculate_metrics(matrix, learning_order, column_order)
+        rows.append({
+            'Method': name,
+            'FR': result['FR']['mean'] * scale,
+            'PFR': result['PFR']['mean'] * scale,
+            'FT': result['FT']['mean'] * scale,
+            'BT': result['BT']['mean'] * scale,
+        })
+    return pd.DataFrame(rows)
 
 
 if __name__ == '__main__':
-    # 示例数据
-    skill_matrix = [[62.5,8.89,40,50,70],  # TF++
-                    [42.5,15.56,83.33,50,78.42],
-                    [53.75,11.11,51.67,50,74.74],
-                    [37.5,46.67,21.67,50,57.37],
-                    [35,8.89,26.67,50,55.79]]
+    print("===== Method comparison (%, FR/PFR lower is better; FT/BT higher is better) =====")
+    print(summarize_methods(METHOD_MATRICES, LEARNING_ORDER).to_string(index=False))
 
-    skill_matrix = np.array(skill_matrix)  # 您的实际数据
-    learning_order = ['EmergencyBrake', 'TrafficSign', 'Merging', 'Overtaking', 'GiveWay']
-    # learning_order = ['GiveWay', 'Overtaking', 'Merging', 'TrafficSign', 'EmergencyBrake']
+    name = next(iter(METHOD_MATRICES))
+    result = calculate_metrics(METHOD_MATRICES[name], LEARNING_ORDER)
 
-    # 计算指标
-    (forgetting_list, forgetting_avg,
-     forward_transfer_list, forward_transfer_avg,
-     backward_transfer_list, backward_transfer_avg,
-     process_forgetting_list, process_forgetting_avg,
-     forgetting_ratio_list, forgetting_ratio_avg,
-     process_forgetting_ratio_list, process_forgetting_ratio_avg) = calculate_metrics(skill_matrix, learning_order)
+    print("\n===== %s: performance matrix R (rows=stages, cols=learning order, %%) =====" % name)
+    print(pd.DataFrame(np.round(result['R'] * 100.0, 2),
+                       index=['after %s' % t for t in LEARNING_ORDER],
+                       columns=LEARNING_ORDER).to_string())
 
-    # 准备结果数据 - 详细列出每个任务的指标
-    results = []
+    print("\n===== %s: per-task metrics (%%) =====" % name)
+    print(metrics_to_frame(result).to_string(index=False))
 
-    # 1. 遗忘率（绝对值）
-    results.append({'Task': 'Overall', 'Metric': 'Forgetting (abs)', 'Value': forgetting_avg})
-    for i, task_name in enumerate(learning_order):
-        results.append({'Task': task_name, 'Metric': 'Forgetting (abs)', 'Value': forgetting_list[i]})
-
-    # 1.1 遗忘比率（相对值）
-    results.append({'Task': 'Overall', 'Metric': 'Forgetting Ratio', 'Value': forgetting_ratio_avg})
-    for i, task_name in enumerate(learning_order):
-        results.append({'Task': task_name, 'Metric': 'Forgetting Ratio', 'Value': forgetting_ratio_list[i]})
-
-    # 2. 后向迁移率
-    results.append({'Task': 'Overall', 'Metric': 'Forward Transfer', 'Value': forward_transfer_avg})
-    for i, task_name in enumerate(learning_order):
-        results.append({'Task': task_name, 'Metric': 'Forward Transfer', 'Value': forward_transfer_list[i]})
-
-    # 3. 前向迁移率
-    results.append({'Task': 'Overall', 'Metric': 'Backward Transfer', 'Value': backward_transfer_avg})
-    for i, task_name in enumerate(learning_order):
-        results.append({'Task': task_name, 'Metric': 'Backward Transfer', 'Value': backward_transfer_list[i]})
-
-    # 4. 过程遗忘率（绝对值）
-    results.append({'Task': 'Overall', 'Metric': 'Process Forgetting (abs)', 'Value': process_forgetting_avg})
-    for i, task_name in enumerate(learning_order):
-        results.append({'Task': task_name, 'Metric': 'Process Forgetting (abs)', 'Value': process_forgetting_list[i]})
-
-    # 4.1 过程遗忘比率（相对值）
-    results.append({'Task': 'Overall', 'Metric': 'Process Forgetting Ratio', 'Value': process_forgetting_ratio_avg})
-    for i, task_name in enumerate(learning_order):
-        results.append(
-            {'Task': task_name, 'Metric': 'Process Forgetting Ratio', 'Value': process_forgetting_ratio_list[i]})
-
-    # 5. 任务性能快照 - 显示每个任务在完成时的性能
-    for i, task_name in enumerate(learning_order):
-        test_index = {'EmergencyBrake': 2, 'TrafficSign': 4, 'Merging': 0,
-                      'Overtaking': 1, 'GiveWay': 3}[task_name]
-        performance = skill_matrix[i, test_index]
-        results.append({'Task': task_name, 'Metric': 'Performance at Completion', 'Value': performance})
-
-    # 6. 任务最终性能 - 显示每个任务在所有任务完成后的性能
-    for i, task_name in enumerate(learning_order):
-        test_index = {'EmergencyBrake': 2, 'TrafficSign': 4, 'Merging': 0,
-                      'Overtaking': 1, 'GiveWay': 3}[task_name]
-        final_performance = skill_matrix[-1, test_index]
-        results.append({'Task': task_name, 'Metric': 'Final Performance', 'Value': final_performance})
-
-    # 转换为DataFrame
-    df = pd.DataFrame(results)
-
-    # 按任务和指标排序，使结果更清晰
-    metric_order = ['Forgetting (abs)', 'Forgetting Ratio',
-                    'Forward Transfer', 'Backward Transfer',
-                    'Process Forgetting (abs)', 'Process Forgetting Ratio',
-                    'Performance at Completion', 'Final Performance']
-    df['Metric'] = pd.Categorical(df['Metric'], categories=metric_order, ordered=True)
-    df = df.sort_values(['Task', 'Metric'])
-
-    # 保存结果到CSV
-    # df.to_csv('driving_skills_metrics.csv', index=False)
-
-    # 打印详细结果
-    print("\n===== 详细指标结果 =====")
-    print(df.to_string(index=False))
-
-    # 打印关键总结
-    print("\n===== 指标总结 =====")
-    print(f"整体遗忘率 (绝对值, [-1,1], 越低越好): {forgetting_avg:.4f}")
-    print(f"整体遗忘比率 (相对值, <1, 越低越好): {forgetting_ratio_avg:.4f}")
-    print(f"整体后向迁移率 ([0,1], 越高越好): {forward_transfer_avg:.4f}")
-    print(f"整体前向迁移率 ([0,1], 越高越好): {backward_transfer_avg:.4f}")
-    print(f"整体过程遗忘率 (绝对值, [-1,1], 越低越好): {process_forgetting_avg:.4f}")
-    print(f"整体过程遗忘比率 (相对值, <1, 越低越好): {process_forgetting_ratio_avg:.4f}")
-
-    print("\n===== 每个任务的具体指标 =====")
-    print(f"遗忘率 (绝对值, 最后一个任务为NaN):")
-    for i, task_name in enumerate(learning_order):
-        value = forgetting_list[i]
-        value_str = f"{value:.4f}" if not np.isnan(value) else "NaN"
-        print(f"  {task_name}: {value_str}")
-
-    print(f"\n遗忘比率 (相对值, 最后一个任务为NaN):")
-    for i, task_name in enumerate(learning_order):
-        value = forgetting_ratio_list[i]
-        value_str = f"{value:.4f}" if not np.isnan(value) else "NaN"
-        print(f"  {task_name}: {value_str}")
-
-    print(f"\n后向迁移率 (第一个任务为NaN):")
-    for i, task_name in enumerate(learning_order):
-        value = forward_transfer_list[i]
-        value_str = f"{value:.4f}" if not np.isnan(value) else "NaN"
-        print(f"  {task_name}: {value_str}")
-
-    print(f"\n前向迁移率 (最后一个任务为NaN):")
-    for i, task_name in enumerate(learning_order):
-        value = backward_transfer_list[i]
-        value_str = f"{value:.4f}" if not np.isnan(value) else "NaN"
-        print(f"  {task_name}: {value_str}")
-
-    print(f"\n过程遗忘率 (绝对值, 最后一个任务为NaN):")
-    for i, task_name in enumerate(learning_order):
-        value = process_forgetting_list[i]
-        value_str = f"{value:.4f}" if not np.isnan(value) else "NaN"
-        print(f"  {task_name}: {value_str}")
-
-    print(f"\n过程遗忘比率 (相对值, 最后一个任务为NaN):")
-    for i, task_name in enumerate(learning_order):
-        value = process_forgetting_ratio_list[i]
-        value_str = f"{value:.4f}" if not np.isnan(value) else "NaN"
-        print(f"  {task_name}: {value_str}")
-
-    # print("\n详细结果已保存至 'driving_skills_metrics.csv'")
+    print("\n" + format_summary(result))

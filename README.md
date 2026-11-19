@@ -232,6 +232,8 @@ Edit the `__main__` block in `lifelong_metric/forgetting_and_transfer_eval.py`:
 
 ```python
 # Example: fill in your evaluation results
+learning_order = ['EmergencyBrake', 'TrafficSign', 'Merging', 'Overtaking', 'GiveWay']
+
 skill_matrix = [
     [62.5,  8.89, 40.0,  50.0, 70.0],   # After ability 1 (EmergencyBrake)
     [42.5, 15.56, 83.33, 50.0, 78.42],   # After ability 2 (TrafficSign)
@@ -239,15 +241,10 @@ skill_matrix = [
     [37.5, 46.67, 21.67, 50.0, 57.37],   # After ability 4 (Overtaking)
     [35.0,  8.89, 26.67, 50.0, 55.79],   # After ability 5 (GiveWay)
 ]
-
-learning_order = ['EmergencyBrake', 'TrafficSign', 'Merging', 'Overtaking', 'GiveWay']
 ```
 
-Then run:
+Then run the script.
 
-```Shell
-python lifelong_metric/forgetting_and_transfer_eval.py
-```
 
 ### Computed Metrics
 
